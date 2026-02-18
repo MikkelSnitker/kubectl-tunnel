@@ -26,7 +26,7 @@ async fn handle_handshake(
     reader: &mut OwnedReadHalf,
 ) -> std::result::Result<tun::AsyncDevice, tun::Error> {
     let mut handshake = [0u8; 14];
-    let len = reader.read_exact(&mut handshake).await?;
+    let _len = reader.read_exact(&mut handshake).await?;
     let local = Ipv4Addr::from_octets(handshake[0..4].try_into().expect("Invalid bytes"));
     let mask = Ipv4Addr::from_octets(handshake[4..8].try_into().expect("Invalid bytes"));
     let remote = Ipv4Addr::from_octets(handshake[8..12].try_into().expect("Invalid bytes"));

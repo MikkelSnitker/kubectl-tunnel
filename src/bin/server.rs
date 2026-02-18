@@ -1,15 +1,14 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use kubectl_tunnel::codec::TUNCodec;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
-    str::FromStr,
+    net::Ipv4Addr,
     sync::Arc,
     u32,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, WriteHalf},
+    io::AsyncWriteExt,
     net::{TcpListener, tcp::OwnedWriteHalf},
     sync::Mutex,
 };
@@ -27,7 +26,7 @@ pub struct Cli {
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
-async fn create_tunnel(host: Ipv4Addr, mask: Ipv4Addr) -> Result<()> {
+async fn create_tunnel(_host: Ipv4Addr, _mask: Ipv4Addr) -> Result<()> {
     Ok(())
 }
 
@@ -67,8 +66,8 @@ async fn main() -> Result<()> {
     });
 
     let dev = tun::create_as_async(&config).unwrap();
-    let (mut tun_writer, mut tun_reader) = dev.split()?;
-    let mut tun_writer = tokio_util::codec::FramedWrite::new(tun_writer, TUNCodec(mtu, true));
+    let (tun_writer, tun_reader) = dev.split()?;
+    let tun_writer = tokio_util::codec::FramedWrite::new(tun_writer, TUNCodec(mtu, true));
     let mut tun_reader = tokio_util::codec::FramedRead::new(tun_reader, TUNCodec(mtu, true));
     let tun_writer = Arc::new(Mutex::new(tun_writer));
     let tunnel = tunnels.clone();

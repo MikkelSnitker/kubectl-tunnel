@@ -1,4 +1,4 @@
-use std::{io::Write, net::Ipv4Addr, str::FromStr};
+use std::{io::Write, net::Ipv4Addr};
 
 use kube::{
     Api, Client, Config, ResourceExt,
