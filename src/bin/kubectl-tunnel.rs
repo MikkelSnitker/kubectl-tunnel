@@ -110,9 +110,10 @@ async fn main() -> std::result::Result<(), kube::Error> {
 
     let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
     let client = Client::try_from(config)?;
+    let pods: Api<Pod> = if let Some(ns) = args.namespace {Api::namespaced(client, &ns)} else { Api::default_namespaced(client)};
     match args.command {
         Commands::Connect { name } => {
-            let pods: Api<Pod> = Api::default_namespaced(client);
+           
             if let Err(err) = pods.get(&name).await {
                 match err {
                     kube::Error::Api(status) => eprintln!("{status}"),
@@ -201,7 +202,6 @@ async fn main() -> std::result::Result<(), kube::Error> {
         }
 
         Commands::Create { file_name } => {
-            let pods: Api<Pod> = Api::default_namespaced(client);
             let file = std::fs::File::open(&file_name).unwrap();
             let pod: Pod = serde_yaml::from_reader(file).unwrap();
             match pods.create(&PostParams::default(), &pod).await {
@@ -213,7 +213,6 @@ async fn main() -> std::result::Result<(), kube::Error> {
         }
 
         Commands::Delete { name } => {
-            let pods: Api<Pod> = Api::default_namespaced(client);
             match pods.delete(&name, &DeleteParams::default()).await {
                 Ok(either::Either::Left(pod)) => {
                     println!("pod \"{name}\" deleted from default namespace");
