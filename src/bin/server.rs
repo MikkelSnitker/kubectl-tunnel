@@ -26,10 +26,6 @@ pub struct Cli {
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
-async fn create_tunnel(_host: Ipv4Addr, _mask: Ipv4Addr) -> Result<()> {
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
