@@ -13,6 +13,7 @@ use tokio::{
     sync::Mutex,
 };
 
+const MAX_SIZE: usize = 1024*96;
 #[derive(Parser, Debug)]
 #[command(name = "tunnel", about = "Tunnel server", version)]
 pub struct Cli {
@@ -22,6 +23,9 @@ pub struct Cli {
 
     #[arg(long, default_value = "1234")]
     pub port: u16,
+
+    #[arg(long, default_value = "1400")]
+    pub mtu: u16,
 }
 
 type Result<T> = std::result::Result<T, std::io::Error>;
@@ -40,7 +44,7 @@ async fn main() -> Result<()> {
     let mut next_host = 1;
 
     println!("Number of hosts: {} next host: {}", num_of_hosts, next_host);
-    let mtu = 1400;
+    let mtu = args.mtu;
     let local = Ipv4Addr::from(u32::from(network) + 1);
     let mut config = tun::Configuration::default();
     config
@@ -55,16 +59,20 @@ async fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         config.ensure_root_privileges(true);
 
-        config.packet_information(false);
+        config.packet_information(true);
 
         #[cfg(target_os = "macos")]
         config.enable_routing(true);
     });
 
     let dev = tun::create_as_async(&config).unwrap();
-    let (tun_writer, tun_reader) = dev.split()?;
-    let tun_writer = tokio_util::codec::FramedWrite::new(tun_writer, TUNCodec(mtu, true));
-    let mut tun_reader = tokio_util::codec::FramedRead::new(tun_reader, TUNCodec(mtu, true));
+    let f = tokio_util::codec::Framed::new(dev, TUNCodec(mtu, true));
+    
+    //let (tun_writer, tun_reader) = dev.split()?;
+    //let tun_writer = tokio_util::codec::FramedWrite::with_capacity(tun_writer, TUNCodec(mtu, true), MAX_SIZE);
+    //let mut tun_reader = tokio_util::codec::FramedRead::with_capacity(tun_reader, TUNCodec(mtu, true),MAX_SIZE);
+    
+    let (tun_writer, mut tun_reader) = f.split();
     let tun_writer = Arc::new(Mutex::new(tun_writer));
     let tunnel = tunnels.clone();
     tokio::spawn(async move {
@@ -158,8 +166,8 @@ async fn main() -> Result<()> {
                     
                     let _ = writer.write(&buf).await;
                   
-                    let writer = tokio_util::codec::FramedWrite::new(writer, TUNCodec(mtu, false));
-                    let mut reader = tokio_util::codec::FramedRead::new(reader, TUNCodec(mtu, false));
+                    let writer = tokio_util::codec::FramedWrite::with_capacity(writer, TUNCodec(mtu, false),MAX_SIZE);
+                    let mut reader = tokio_util::codec::FramedRead::with_capacity(reader, TUNCodec(mtu, false),MAX_SIZE);
                     {
                     let mut tunnels = tunnels.lock().await;
 

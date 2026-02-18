@@ -120,3 +120,38 @@ pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
 
     tun::create_as_async(&config)
 }
+
+
+use std::collections::BTreeMap;
+
+/// Group domains by their "base" suffix (last 2 labels).
+/// Examples:
+/// - default.svc.cluster.local -> cluster.local
+/// - c.gowish-devx.internal    -> gowish-devx.internal
+/// - google.internal           -> google.internal
+pub fn group_by_base_suffix<'a, I>(domains: I) -> BTreeMap<String, Vec<String>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for d in domains {
+        let d = d.trim().trim_end_matches('.'); // tolerate trailing dot
+        if d.is_empty() {
+            continue;
+        }
+
+        let labels: Vec<&str> = d.split('.').filter(|s| !s.is_empty()).collect();
+
+        // Base suffix = last 2 labels, or the whole thing if < 2 labels.
+        let key = match labels.len() {
+            0 => continue,
+            1 => labels[0].to_string(),
+            _ => format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]),
+        };
+
+        out.entry(key).or_default().push(d.to_string());
+    }
+
+    out
+}

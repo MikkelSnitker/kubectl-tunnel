@@ -56,13 +56,13 @@ async fn create_tunnel(
     stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> Result<(String, impl Future<Output = Result<()>>)> {
     let (mut tcp_reader, mut tcp_writer) = tokio::io::split(stream);
-    
+
     let dev = kubectl_tunnel::utils::handle_handshake(&mut tcp_reader).await?;
     let mtu = dev.mtu().expect("Invalid mtu");
     let device_name = dev.tun_name()?;
 
-    let mut tcp_reader = tokio_util::codec::FramedRead::new(tcp_reader, TUNCodec(mtu,false));
-    let mut tcp_writer = tokio_util::codec::FramedWrite::new(tcp_writer, TUNCodec(mtu,false));
+    let mut tcp_reader = tokio_util::codec::FramedRead::new(tcp_reader, TUNCodec(mtu, false));
+    let mut tcp_writer = tokio_util::codec::FramedWrite::new(tcp_writer, TUNCodec(mtu, false));
 
     let (mut tun_writer, mut tun_reader) = dev.split()?;
 
@@ -73,10 +73,10 @@ async fn create_tunnel(
     let task_a = async move {
         while let Some(packet) = tcp_reader.next().await {
             if let Ok(packet) = packet {
-               let _ = tun_writer.send(packet).await;
+                let _ = tun_writer.send(packet).await;
             }
         }
-         Ok::<(), std::io::Error>(())
+        Ok::<(), std::io::Error>(())
     };
 
     // TUN -> TCP: read from the TUN device and write back to the port-forward stream.
@@ -91,7 +91,7 @@ async fn create_tunnel(
     };
 
     let fut = async move {
-        let _= tokio::try_join!(task_a, task_b);
+        let _ = tokio::try_join!(task_a, task_b);
         Ok(())
     };
 
@@ -100,7 +100,7 @@ async fn create_tunnel(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), kube::Error> {
-    let args = Cli::parse();
+       let args = Cli::parse();
     let kubeconfig = Kubeconfig::read()?;
     let options = KubeConfigOptions {
         context: args.context.or_else(|| std::env::var("KUBE_CONTEXT").ok()),
@@ -110,10 +110,13 @@ async fn main() -> std::result::Result<(), kube::Error> {
 
     let config = Config::from_custom_kubeconfig(kubeconfig, &options).await?;
     let client = Client::try_from(config)?;
-    let pods: Api<Pod> = if let Some(ns) = args.namespace {Api::namespaced(client, &ns)} else { Api::default_namespaced(client)};
+    let pods: Api<Pod> = if let Some(ns) = args.namespace {
+        Api::namespaced(client, &ns)
+    } else {
+        Api::default_namespaced(client)
+    };
     match args.command {
         Commands::Connect { name } => {
-           
             if let Err(err) = pods.get(&name).await {
                 match err {
                     kube::Error::Api(status) => eprintln!("{status}"),
@@ -131,7 +134,7 @@ async fn main() -> std::result::Result<(), kube::Error> {
                             .annotations()
                             .get("tunnel/port")
                             .expect("Tunnel port missing");
-                        
+
                         let port = port.parse::<u16>().expect("Invalid port");
 
                         let routes = pod
@@ -176,21 +179,32 @@ async fn main() -> std::result::Result<(), kube::Error> {
                         }
 
                         if let Some(dns) = dns {
-                            let path = std::path::Path::new("/etc/resolver/svc.cluster.local");
+                            for mut line in dns.lines().map(|l| l.split(": ")) {
+                                 if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
+                                    let search = kubectl_tunnel::utils::group_by_base_suffix(search.split_ascii_whitespace());
 
-                            if let Some(parent) = path.parent() {
-                                std::fs::create_dir_all(parent)
-                                    .expect("Unable to create dns resolver folder");
+                                    for (domain, search) in search {
+                                        let resolver_path = &format!("/etc/resolver/{domain}");
+                                        let path = std::path::Path::new(resolver_path);
+                                        if let Some(parent) = path.parent() {
+                                            std::fs::create_dir_all(parent)
+                                                .expect("Unable to create dns resolver folder");
+                                        }
+
+                                        let mut file = std::fs::File::create(path)
+                                            .expect("Unable to create dns resolver");
+                                        let resolver = format!(
+                                            "search {}\nnameserver {nameserver}",
+                                            search.join(" ").to_string()
+                                        );
+                                        if let Ok(_) = writeln!(file, "{resolver}") {
+                                            println!(
+                                                "\n\nAPPLYING DNS: \n\ncat <<EOF >> {resolver_path}\n{resolver}\nEOF"
+                                            );
+                                        }
+                                    }
+                                }
                             }
-
-                            let mut file =
-                                std::fs::File::create(path).expect("Unable to create dns resolver");
-                            file.write_all(dns.as_bytes())
-                                .expect("Unable to write resolver");
-                            println!(
-                                "\n\nAPPLYING DNS: \n\ncat <<EOF >> /etc/resolver/svc.cluster.local\n{}\nEOF",
-                                dns
-                            );
                         }
                         let _ = conn.await;
                     }
@@ -212,29 +226,25 @@ async fn main() -> std::result::Result<(), kube::Error> {
             }
         }
 
-        Commands::Delete { name } => {
-            match pods.delete(&name, &DeleteParams::default()).await {
-                Ok(either::Either::Left(pod)) => {
-                    println!("pod \"{name}\" deleted from default namespace");
-                    if let Some(uid) = pod.uid() {
-                        if let Err(err) =
-                            await_condition(pods.clone(), &name, is_deleted(&uid)).await
-                        {
-                            eprintln!("{err}");
-                        }
+        Commands::Delete { name } => match pods.delete(&name, &DeleteParams::default()).await {
+            Ok(either::Either::Left(pod)) => {
+                println!("pod \"{name}\" deleted from default namespace");
+                if let Some(uid) = pod.uid() {
+                    if let Err(err) = await_condition(pods.clone(), &name, is_deleted(&uid)).await {
+                        eprintln!("{err}");
                     }
                 }
-
-                Ok(either::Either::Right(status)) => {
-                    println!("DELETE STATUS {status}");
-                }
-
-                Err(err) => match err {
-                    kube::Error::Api(status) => eprintln!("Error from server: {status}"),
-                    _ => eprintln!("{err}"),
-                },
             }
-        }
+
+            Ok(either::Either::Right(status)) => {
+                println!("DELETE STATUS {status}");
+            }
+
+            Err(err) => match err {
+                kube::Error::Api(status) => eprintln!("Error from server: {status}"),
+                _ => eprintln!("{err}"),
+            },
+        },
     }
 
     Ok(())
