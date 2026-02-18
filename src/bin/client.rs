@@ -22,44 +22,14 @@ pub struct Cli {
     pub port: u16,
 }
 
-async fn handle_handshake(
-    reader: &mut OwnedReadHalf,
-) -> std::result::Result<tun::AsyncDevice, tun::Error> {
-    let mut handshake = [0u8; 14];
-    let _len = reader.read_exact(&mut handshake).await?;
-    let local = Ipv4Addr::from_octets(handshake[0..4].try_into().expect("Invalid bytes"));
-    let mask = Ipv4Addr::from_octets(handshake[4..8].try_into().expect("Invalid bytes"));
-    let remote = Ipv4Addr::from_octets(handshake[8..12].try_into().expect("Invalid bytes"));
-    let mtu = u16::from_be_bytes(handshake[12..14].try_into().expect("Invalid bytes"));
-
-    let mut config = tun::Configuration::default();
-    config
-        .address(local)
-        .netmask(mask)
-        .destination(remote)
-        .mtu(mtu)
-        .up();
-
-    config.platform_config(|config| {
-        // requiring root privilege to acquire complete functions
-        #[cfg(target_os = "linux")]
-        config.ensure_root_privileges(true);
-
-        config.packet_information(false);
-
-        #[cfg(target_os = "macos")]
-        config.enable_routing(true);
-    });
-
-    tun::create_as_async(&config)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
     let stream = TcpStream::connect((args.server, args.port)).await?;
     let (mut reader, writer) = stream.into_split();
-    if let Ok(dev) = handle_handshake(&mut reader).await {
+     
+    if let Ok(dev) = kubectl_tunnel::utils::handle_handshake(&mut reader).await {
         println!("TUN {}", dev.tun_name().unwrap());
         let mtu = dev.mtu().unwrap();
         
