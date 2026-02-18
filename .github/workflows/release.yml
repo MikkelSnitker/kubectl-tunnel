@@ -44,6 +44,8 @@ jobs:
       #    sudo apt-get update
       #    sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Setup
+        run: rustup target add aarch64-unknown-linux-gnu x86_64-apple-darwin
       - name: Build
         run: cargo build --release --bin kubectl-tunnel --target ${{ matrix.target }}
 
