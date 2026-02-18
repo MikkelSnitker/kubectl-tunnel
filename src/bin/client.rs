@@ -1,10 +1,11 @@
 use std::net::Ipv4Addr;
 
+use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use kubectl_tunnel::codec::TUNCodec;
+use kubectl_tunnel::codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, tcp::OwnedReadHalf},
 };
 use tun::AbstractDevice;
@@ -22,64 +23,49 @@ pub struct Cli {
     pub port: u16,
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
     let stream = TcpStream::connect((args.server, args.port)).await?;
     let (mut reader, writer) = stream.into_split();
-     
+
     if let Ok(dev) = kubectl_tunnel::utils::handle_handshake(&mut reader).await {
         println!("TUN {}", dev.tun_name().unwrap());
         let mtu = dev.mtu().unwrap();
-        
+
         let mut reader = tokio_util::codec::FramedRead::new(reader, TUNCodec(mtu, false));
         let mut writer = tokio_util::codec::FramedWrite::new(writer, TUNCodec(mtu, false));
-    
-
-        let (tun_write, tun_read) = dev.split()?;
-
-        let mut tun_reader = tokio_util::codec::FramedRead::new(tun_read, TUNCodec(mtu, true));
-        let mut tun_writer = tokio_util::codec::FramedWrite::new(tun_write, TUNCodec(mtu, true));
+        let (mut tun_writer, mut tun_reader) = dev.split()?;
 
         tokio::spawn(async move {
-            while let Some(packet) = tun_reader.next().await {
-                match packet {
-                    Ok(packet) => {
-                    /*    let data = [packet.header(), packet.payload()].concat();
-                        let _ = writer.write(&data).await;
-                         */
-                        let _ = writer.send(packet).await;
+            let mut bufa = BytesMut::with_capacity(MAX_SIZE);
+            let mut buf = [0x0u8; MAX_SIZE];
+
+            loop {
+                match tun_reader.read(&mut buf).await {
+                    Ok(len) => {
+                        bufa.put_slice(&buf[0..len]);
+
+                        while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
+                            let _ = writer.send(packet).await;
+                        }
                     }
+
                     Err(err) => {
-                        eprintln!("Error {err}");
-                        return Err(err);
+                        eprintln!("{err}");
                     }
                 };
             }
-            /*
-            let mut buf = [0u8; 1500];
-
-              while let Ok(len) = tun_reader.read(&mut buf).await {
-
-                 #[cfg(target_os = "macos")]
-                 let buf = &buf[4..]; // REMOVE FRAME INFO
-
-                 let _ = writer.write(&buf[0..len]).await;
-                 let _ = writer.flush().await;
-             }*/
-
-            Ok::<(), packet::Error>(())
         });
 
         while let Some(packet) = reader.next().await {
             match packet {
                 Ok(packet) => {
-                    let _ = tun_writer.send(packet).await;
-                },
+                    let _ = tun_writer.write(&encode(packet)?).await;
+                }
                 Err(err) => {
                     eprintln!("Error {err}");
-                },
+                }
             }
         }
     }

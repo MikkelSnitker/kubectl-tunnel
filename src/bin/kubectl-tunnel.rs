@@ -1,5 +1,6 @@
 use std::{io::Write, net::Ipv4Addr};
 
+use bytes::{BufMut as _, BytesMut};
 use futures::{SinkExt, StreamExt};
 use kube::{
     Api, Client, Config, ResourceExt,
@@ -10,7 +11,10 @@ use kube::{
         wait::await_condition,
     },
 };
-use kubectl_tunnel::{codec::TUNCodec, utils::handle_handshake};
+use kubectl_tunnel::{
+    codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet},
+    utils::handle_handshake,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use k8s_openapi::api::core::v1::Pod;
@@ -55,7 +59,7 @@ pub enum Commands {
 async fn create_tunnel(
     stream: impl AsyncRead + AsyncWrite + Unpin,
 ) -> Result<(String, impl Future<Output = Result<()>>)> {
-    let (mut tcp_reader, mut tcp_writer) = tokio::io::split(stream);
+    let (mut tcp_reader, tcp_writer) = tokio::io::split(stream);
 
     let dev = kubectl_tunnel::utils::handle_handshake(&mut tcp_reader).await?;
     let mtu = dev.mtu().expect("Invalid mtu");
@@ -66,14 +70,11 @@ async fn create_tunnel(
 
     let (mut tun_writer, mut tun_reader) = dev.split()?;
 
-    let mut tun_writer = tokio_util::codec::FramedWrite::new(tun_writer, TUNCodec(mtu, true));
-    let mut tun_reader = tokio_util::codec::FramedRead::new(tun_reader, TUNCodec(mtu, true));
-
     // TCP -> TUN: read from the port-forward stream and write into the TUN device.
     let task_a = async move {
         while let Some(packet) = tcp_reader.next().await {
             if let Ok(packet) = packet {
-                let _ = tun_writer.send(packet).await;
+                let _ = tun_writer.write(&encode(packet)?).await;
             }
         }
         Ok::<(), std::io::Error>(())
@@ -81,10 +82,23 @@ async fn create_tunnel(
 
     // TUN -> TCP: read from the TUN device and write back to the port-forward stream.
     let task_b = async move {
-        while let Some(packet) = tun_reader.next().await {
-            if let Ok(packet) = packet {
-                let _ = tcp_writer.send(packet).await;
-            }
+        let mut bufa = BytesMut::with_capacity(MAX_SIZE);
+        let mut buf = [0x0u8; MAX_SIZE];
+
+        loop {
+            match tun_reader.read(&mut buf).await {
+                Ok(len) => {
+                    bufa.put_slice(&buf[0..len]);
+
+                    while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
+                        let _ = tcp_writer.send(packet).await;
+                    }
+                }
+
+                Err(err) => {
+                    eprintln!("{err}");
+                }
+            };
         }
 
         Ok::<(), std::io::Error>(())
@@ -100,7 +114,7 @@ async fn create_tunnel(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), kube::Error> {
-       let args = Cli::parse();
+    let args = Cli::parse();
     let kubeconfig = Kubeconfig::read()?;
     let options = KubeConfigOptions {
         context: args.context.or_else(|| std::env::var("KUBE_CONTEXT").ok()),
@@ -180,8 +194,11 @@ async fn main() -> std::result::Result<(), kube::Error> {
 
                         if let Some(dns) = dns {
                             for mut line in dns.lines().map(|l| l.split(": ")) {
-                                 if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
-                                    let search = kubectl_tunnel::utils::group_by_base_suffix(search.split_ascii_whitespace());
+                                if let (Some(nameserver), Some(search)) = (line.next(), line.next())
+                                {
+                                    let search = kubectl_tunnel::utils::group_by_base_suffix(
+                                        search.split_ascii_whitespace(),
+                                    );
 
                                     for (domain, search) in search {
                                         let resolver_path = &format!("/etc/resolver/{domain}");
