@@ -38,11 +38,11 @@ jobs:
       #  with:
       #    targets: ${{ matrix.target }}
 
-      #- name: Install Linux aarch64 toolchain
-      #  if: matrix.target == 'aarch64-unknown-linux-gnu'
-      #  run: |
-      #    sudo apt-get update
-      #    sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install Linux aarch64 toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Setup
         run: rustup target add aarch64-unknown-linux-gnu x86_64-apple-darwin
