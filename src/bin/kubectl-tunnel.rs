@@ -1,4 +1,4 @@
-use std::{io::Write, net::Ipv4Addr};
+use std::{cell::RefCell, io::Write, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use bytes::{BufMut as _, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -13,7 +13,7 @@ use kube::{
 };
 use kubectl_tunnel::{
     codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet},
-    utils::handle_handshake,
+    utils::{create_device, handle_handshake},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -56,19 +56,22 @@ pub enum Commands {
     Create { file_name: String },
 }
 
-async fn create_tunnel(
-    stream: impl AsyncRead + AsyncWrite + Unpin,
-) -> Result<(String, impl Future<Output = Result<()>>)> {
+async fn create_tunnel<'a>(
+    dev: &'a mut AsyncDevice,
+    stream: impl AsyncRead + AsyncWrite + Unpin + 'a,
+) -> Result<(String, impl Future<Output = Result<()>> + 'a)> {
     let (mut tcp_reader, tcp_writer) = tokio::io::split(stream);
 
-    let dev = kubectl_tunnel::utils::handle_handshake(&mut tcp_reader).await?;
+    let config = kubectl_tunnel::utils::handle_handshake(&mut tcp_reader).await?;
+
+    dev.configure(&config)?;
     let mtu = dev.mtu().expect("Invalid mtu");
     let device_name = dev.tun_name()?;
 
     let mut tcp_reader = tokio_util::codec::FramedRead::new(tcp_reader, TUNCodec(mtu, false));
     let mut tcp_writer = tokio_util::codec::FramedWrite::new(tcp_writer, TUNCodec(mtu, false));
 
-    let (mut tun_writer, mut tun_reader) = dev.split()?;
+    let (mut tun_reader, mut tun_writer) = tokio::io::split(dev);
 
     // TCP -> TUN: read from the port-forward stream and write into the TUN device.
     let task_a = async move {
@@ -105,7 +108,17 @@ async fn create_tunnel(
     };
 
     let fut = async move {
-        let _ = tokio::try_join!(task_a, task_b);
+        let _ = tokio::select!(
+            a = task_a => {
+                println!("Task A stopped {a:?}")
+            },
+
+            b = task_b => {
+                println!("Task B stopped {b:?}")
+            }
+        );
+
+        //task_a, task_b);
         Ok(())
     };
 
@@ -172,63 +185,67 @@ async fn main() -> std::result::Result<(), kube::Error> {
                     }
                 };
 
-            // Start the Kubernetes port-forward and bridge it to the TUN device.
-            let mut forwarder = pods.portforward(&name, &[port]).await?;
-            if let Some(upstream_conn) = forwarder.take_stream(port) {
-                match create_tunnel(upstream_conn).await {
-                    Ok((name, conn)) => {
-                        // Apply per-route OS routing so traffic hits the TUN interface.
-                        println!("APPLYING ROUTES: \n");
-                        for route in routes {
-                            let _ = std::process::Command::new("route")
-                                .args([
-                                    "-n",
-                                    "add",
-                                    "-net",
-                                    route.as_str(),
-                                    "-interface",
-                                    name.as_str(),
-                                ])
-                                .status();
-                        }
+            let mut dev = create_device().expect("Unable to create TUN");
 
-                        if let Some(dns) = dns {
-                            for mut line in dns.lines().map(|l| l.split(": ")) {
-                                if let (Some(nameserver), Some(search)) = (line.next(), line.next())
-                                {
-                                    let search = kubectl_tunnel::utils::group_by_base_suffix(
-                                        search.split_ascii_whitespace(),
-                                    );
+            // Apply per-route OS routing so traffic hits the TUN interface.
+            println!("APPLYING ROUTES: \n");
+            for route in routes.clone() {
+                let _ = std::process::Command::new("route")
+                    .args([
+                        "-n",
+                        "add",
+                        "-net",
+                        route.as_str(),
+                        "-interface",
+                        dev.tun_name().expect("Invalid TUN name").as_str(),
+                    ])
+                    .status();
+            }
 
-                                    for (domain, search) in search {
-                                        let resolver_path = &format!("/etc/resolver/{domain}");
-                                        let path = std::path::Path::new(resolver_path);
-                                        if let Some(parent) = path.parent() {
-                                            std::fs::create_dir_all(parent)
-                                                .expect("Unable to create dns resolver folder");
-                                        }
+            if let Some(dns) = dns.clone() {
+                for mut line in dns.lines().map(|l| l.split(": ")) {
+                    if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
+                        let search = kubectl_tunnel::utils::group_by_base_suffix(
+                            search.split_ascii_whitespace(),
+                        );
 
-                                        let mut file = std::fs::File::create(path)
-                                            .expect("Unable to create dns resolver");
-                                        let resolver = format!(
-                                            "search {}\nnameserver {nameserver}",
-                                            search.join(" ").to_string()
-                                        );
-                                        if let Ok(_) = writeln!(file, "{resolver}") {
-                                            println!(
-                                                "\n\nAPPLYING DNS: \n\ncat <<EOF >> {resolver_path}\n{resolver}\nEOF"
-                                            );
-                                        }
-                                    }
-                                }
+                        for (domain, search) in search {
+                            let resolver_path = &format!("/etc/resolver/{domain}");
+                            let path = std::path::Path::new(resolver_path);
+                            if let Some(parent) = path.parent() {
+                                std::fs::create_dir_all(parent)
+                                    .expect("Unable to create dns resolver folder");
+                            }
+
+                            let mut file =
+                                std::fs::File::create(path).expect("Unable to create dns resolver");
+                            let resolver = format!(
+                                "search {}\nnameserver {nameserver}",
+                                search.join(" ").to_string()
+                            );
+                            if let Ok(_) = writeln!(file, "{resolver}") {
+                                println!(
+                                    "\n\nAPPLYING DNS: \n\ncat <<EOF >> {resolver_path}\n{resolver}\nEOF"
+                                );
                             }
                         }
-                        let _ = conn.await;
                     }
-                    Err(err) => eprintln!("Tunnel error: {err}"),
                 }
-            } else {
-                eprintln!("Port-forward stream missing for port {port}");
+            }
+
+            loop {
+                // Start the Kubernetes port-forward and bridge it to the TUN device.
+                let mut forwarder = pods.portforward(&name, &[port]).await?;
+                if let Some(upstream_conn) = forwarder.take_stream(port) {
+                    match create_tunnel(&mut dev, upstream_conn).await {
+                        Ok((name, conn)) => {
+                            let _ = conn.await;
+                        }
+                        Err(err) => eprintln!("Tunnel error: {err}"),
+                    }
+                } else {
+                    eprintln!("Port-forward stream missing for port {port}");
+                }
             }
         }
 

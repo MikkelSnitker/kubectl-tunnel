@@ -1,6 +1,7 @@
 use std::{net::Ipv4Addr, str::FromStr};
 
 use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf};
+use tun::{AsyncDevice, ToAddress};
 
 pub fn linux_pi_proto(buf: &[u8]) -> Option<u16> {
     if buf.len() < 4 { return None; }
@@ -89,9 +90,33 @@ pub fn parse_cidr_mask(
     ))
 }
 
+pub fn create_device() -> std::result::Result<AsyncDevice, tun::Error> {
+    let mut config = tun::Configuration::default();
+       
+   config
+        .address("0.0.0.1")
+        .netmask("255.255.255.255")
+        .destination("0.0.0.1")
+        .mtu(1500)
+        .down();
+
+    config.platform_config(|config| {
+        // requiring root privilege to acquire complete functions
+        #[cfg(target_os = "linux")]
+        config.ensure_root_privileges(true);
+
+        config.packet_information(false);
+
+        #[cfg(target_os = "macos")]
+        config.enable_routing(true);
+    });
+
+    tun::create_as_async(&config)
+}
+
 pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
     reader: &mut T,
-) -> std::result::Result<tun::AsyncDevice, tun::Error> {
+) -> std::result::Result<tun::Configuration, tun::Error> {
     let mut handshake = [0u8; 14];
     let _len = reader.read_exact(&mut handshake).await?;
     let local = Ipv4Addr::from_octets(handshake[0..4].try_into().expect("Invalid bytes"));
@@ -118,7 +143,9 @@ pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
         config.enable_routing(true);
     });
 
-    tun::create_as_async(&config)
+    Ok(config)
+
+  //  tun::create_as_async(&config)
 }
 
 

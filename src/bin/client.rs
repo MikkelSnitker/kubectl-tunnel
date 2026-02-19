@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use kubectl_tunnel::codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet};
+use kubectl_tunnel::{codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet}, utils::create_device};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, tcp::OwnedReadHalf},
@@ -29,7 +29,9 @@ async fn main() -> Result<()> {
     let stream = TcpStream::connect((args.server, args.port)).await?;
     let (mut reader, writer) = stream.into_split();
 
-    if let Ok(dev) = kubectl_tunnel::utils::handle_handshake(&mut reader).await {
+    let mut dev = create_device().expect("Unable to create TUN");
+    if let Ok(config) = kubectl_tunnel::utils::handle_handshake(&mut reader).await {
+        dev.configure(&config)?;
         println!("TUN {}", dev.tun_name().unwrap());
         let mtu = dev.mtu().unwrap();
 

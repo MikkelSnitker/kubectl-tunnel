@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-tunnel
+  annotations:
+    tunnel/port: "1234"
+    tunnel/dns: |
+      169.254.20.10: default.svc.cluster.local core-api.svc.cluster.local svc.cluster.local cluster.local europe-west1-c.c.gowish-prod.internal c.gowish-prod.internal google.internal psa-production.gowish-internal gowish.gowish-internal
+    tunnel/routes: |
+      10.111.240.0/28
+      10.16.0.0/20
+      10.160.0.0/20
+      10.192.0.0/16
+      10.100.0.0/20
+      169.254.20.10/32
+spec:
+  containers:
+  - name: tunnel
+    imagePullPolicy: Always
+    image: ghcr.io/mikkelsnitker/tunnel:latest
+    
+    env:
+      - name: TUNNEL_PORT
+        value: "1234"
+      - name: TUNNEL_NETWORK
+        value: "10.0.0.1/24"
+      - name: TUNNEL_MTU
+        value: 1300
+    securityContext:
+      capabilities:
+        add:
+          - NET_ADMIN
+      privileged: true
+    stdin: true
+    tty: true
+  restartPolicy: Never
