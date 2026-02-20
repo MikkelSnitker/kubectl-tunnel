@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::Write, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{io::Write, net::{IpAddr, Ipv4Addr}};
 
 use bytes::{BufMut as _, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -24,6 +24,12 @@ type Result<T> = std::result::Result<T, std::io::Error>;
 use clap::{Parser, Subcommand};
 
 use tun::{AbstractDevice, AsyncDevice};
+
+struct TunnelSettings {
+    port: u16,
+    routes: Vec<String>,
+    dns: Option<String>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "kubectl-tunnel", about = "Tunnel kubectl plugin", version)]
@@ -60,10 +66,13 @@ async fn create_tunnel<'a>(
     dev: &'a mut AsyncDevice,
     stream: impl AsyncRead + AsyncWrite + Unpin + 'a,
 ) -> Result<(String, impl Future<Output = Result<()>> + 'a)> {
+    if let Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) =  dev.address() {
+        println!("LOCAL")
+    }
     let (mut tcp_reader, tcp_writer) = tokio::io::split(stream);
 
-    let config = kubectl_tunnel::utils::handle_handshake(&mut tcp_reader).await?;
-
+    let config = handle_handshake(&mut tcp_reader).await?;
+    
     dev.configure(&config)?;
     let mtu = dev.mtu().expect("Invalid mtu");
     let device_name = dev.tun_name()?;
@@ -76,11 +85,24 @@ async fn create_tunnel<'a>(
     // TCP -> TUN: read from the port-forward stream and write into the TUN device.
     let task_a = async move {
         while let Some(packet) = tcp_reader.next().await {
-            if let Ok(packet) = packet {
-                let _ = tun_writer.write(&encode(packet)?).await;
+            match packet {
+                Ok(packet) => {
+                    match encode(packet) {
+                        Ok(encoded) => {
+                            if let Err(err) = tun_writer.write_all(&encoded).await {
+                                eprintln!("Failed writing to TUN: {err}");
+                                break;
+                            }
+                        }
+                        Err(err) => eprintln!("Failed to encode packet for TUN: {err}"),
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Failed reading from TCP stream: {err}");
+                    break;
+                }
             }
         }
-        Ok::<(), std::io::Error>(())
     };
 
     // TUN -> TCP: read from the TUN device and write back to the port-forward stream.
@@ -90,39 +112,214 @@ async fn create_tunnel<'a>(
 
         loop {
             match tun_reader.read(&mut buf).await {
+                Ok(0) => break,
                 Ok(len) => {
                     bufa.put_slice(&buf[0..len]);
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
-                        let _ = tcp_writer.send(packet).await;
+                        if let Err(err) = tcp_writer.send(packet).await {
+                            eprintln!("Failed writing to TCP stream: {err}");
+                            break;
+                        }
                     }
                 }
 
                 Err(err) => {
-                    eprintln!("{err}");
+                    eprintln!("Failed reading from TUN: {err}");
+                    break;
                 }
             };
         }
-
-        Ok::<(), std::io::Error>(())
     };
 
     let fut = async move {
-        let _ = tokio::select!(
-            a = task_a => {
-                println!("Task A stopped {a:?}")
-            },
-
-            b = task_b => {
-                println!("Task B stopped {b:?}")
-            }
-        );
-
-        //task_a, task_b);
+        tokio::select!(a = task_a => a, b = task_b => b);
         Ok(())
     };
 
     Ok((device_name, fut))
+}
+
+fn extract_tunnel_settings(pod: &Pod) -> std::result::Result<TunnelSettings, String> {
+    let annotations = pod.annotations();
+    let port = annotations
+        .get("tunnel/port")
+        .ok_or_else(|| "Tunnel port missing".to_string())?
+        .parse::<u16>()
+        .map_err(|_| "Invalid tunnel port".to_string())?;
+
+    let routes = annotations
+        .get("tunnel/routes")
+        .map_or_else(Vec::new, |val| val.lines().map(str::to_owned).collect());
+    let dns = annotations.get("tunnel/dns").map(ToOwned::to_owned);
+
+    Ok(TunnelSettings { port, routes, dns })
+}
+
+async fn wait_for_tunnel_settings(
+    pods: &Api<Pod>,
+    pod_name: &str,
+) -> std::result::Result<TunnelSettings, String> {
+    match await_condition(pods.clone(), pod_name, is_pod_running()).await {
+        Ok(Some(pod)) => extract_tunnel_settings(&pod),
+        Ok(None) => Err(format!("Pod not found {pod_name}")),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn apply_routes(interface_name: &str, routes: &[String]) {
+    if routes.is_empty() {
+        return;
+    }
+
+    println!("APPLYING ROUTES:\n");
+    for route in routes {
+        if let Err(err) = std::process::Command::new("route")
+            .args(["-n", "add", "-net", route.as_str(), "-interface", interface_name])
+            .status()
+        {
+            eprintln!("Unable to apply route {route}: {err}");
+        }
+    }
+}
+
+fn apply_dns(dns: Option<&str>) {
+    let Some(dns) = dns else {
+        return;
+    };
+
+    for mut line in dns.lines().map(|l| l.split(": ")) {
+        if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
+            let grouped = kubectl_tunnel::utils::group_by_base_suffix(search.split_ascii_whitespace());
+            for (domain, search) in grouped {
+                let resolver_path = format!("/etc/resolver/{domain}");
+                let path = std::path::Path::new(&resolver_path);
+
+                if let Some(parent) = path.parent()
+                    && let Err(err) = std::fs::create_dir_all(parent)
+                {
+                    eprintln!("Unable to create resolver folder {parent:?}: {err}");
+                    continue;
+                }
+
+                let resolver = format!("search {}\nnameserver {nameserver}", search.join(" "));
+                match std::fs::File::create(path) {
+                    Ok(mut file) => {
+                        if let Err(err) = writeln!(file, "{resolver}") {
+                            eprintln!("Unable to write resolver file {resolver_path}: {err}");
+                        } else {
+                            println!(
+                                "\n\nAPPLYING DNS:\n\ncat <<EOF >> {resolver_path}\n{resolver}\nEOF"
+                            );
+                        }
+                    }
+                    Err(err) => eprintln!("Unable to create resolver file {resolver_path}: {err}"),
+                }
+            }
+        }
+    }
+}
+
+async fn run_connect(pods: Api<Pod>, pod_name: String) -> std::result::Result<(), kube::Error> {
+    
+    let mut dev = create_device().expect("Unable to create TUN");
+
+    let tun_name = match dev.tun_name() {
+        Ok(name) => name,
+        Err(err) => {
+            eprintln!("Unable to read TUN name: {err}");
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = pods.get(&pod_name).await {
+        match err {
+            kube::Error::Api(status) => eprintln!("{status}"),
+            _ => eprintln!("{err}"),
+        };
+        return Ok(());
+    }
+
+    let settings = match wait_for_tunnel_settings(&pods, &pod_name).await {
+        Ok(settings) => settings,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(());
+        }
+    };
+
+    
+
+    apply_routes(&tun_name, &settings.routes);
+    apply_dns(settings.dns.as_deref());
+
+    loop {
+        let mut forwarder = pods.portforward(&pod_name, &[settings.port]).await?;
+        if let Some(upstream_conn) = forwarder.take_stream(settings.port) {
+            println!("Connected...");
+            match create_tunnel(&mut dev, upstream_conn).await {
+                Ok((_name, conn)) => {
+                    let _ = conn.await;
+                    println!("Reconnecting...");
+                    
+                }
+                Err(err) => eprintln!("Tunnel error: {err}"),
+            }
+        } else {
+            eprintln!("Port-forward stream missing for port {}", settings.port);
+        }
+    }
+}
+
+async fn run_create(
+    pods: Api<Pod>,
+    file_name: String,
+) -> std::result::Result<(), kube::Error> {
+    let file = match std::fs::File::open(&file_name) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("Unable to open manifest {file_name}: {err}");
+            return Ok(());
+        }
+    };
+
+    let pod: Pod = match serde_yaml::from_reader(file) {
+        Ok(pod) => pod,
+        Err(err) => {
+            eprintln!("Invalid manifest {file_name}: {err}");
+            return Ok(());
+        }
+    };
+
+    match pods.create(&PostParams::default(), &pod).await {
+        Ok(pod) => println!("pod/{} created", pod.name_any()),
+        Err(err) => eprintln!("{err:?}"),
+    }
+
+    Ok(())
+}
+
+async fn run_delete(
+    pods: Api<Pod>,
+    pod_name: String,
+) -> std::result::Result<(), kube::Error> {
+    match pods.delete(&pod_name, &DeleteParams::default()).await {
+        Ok(either::Either::Left(pod)) => {
+            println!("pod \"{pod_name}\" deleted from default namespace");
+            if let Some(uid) = pod.uid()
+                && let Err(err) = await_condition(pods.clone(), &pod_name, is_deleted(&uid)).await
+            {
+                eprintln!("{err}");
+            }
+        }
+        Ok(either::Either::Right(status)) => println!("DELETE STATUS {status}"),
+        Err(err) => match err {
+            kube::Error::Api(status) => eprintln!("Error from server: {status}"),
+            _ => eprintln!("{err}"),
+        },
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -143,142 +340,9 @@ async fn main() -> std::result::Result<(), kube::Error> {
         Api::default_namespaced(client)
     };
     match args.command {
-        Commands::Connect { name } => {
-            if let Err(err) = pods.get(&name).await {
-                match err {
-                    kube::Error::Api(status) => eprintln!("{status}"),
-                    _ => eprintln!("{err}"),
-                };
-
-                return Ok(());
-            }
-
-            // Wait for the pod to be running and gather tunnel config from annotations.
-            let (port, routes, dns) =
-                match await_condition(pods.clone(), &name, is_pod_running()).await {
-                    Ok(Some(pod)) => {
-                        let port = pod
-                            .annotations()
-                            .get("tunnel/port")
-                            .expect("Tunnel port missing");
-
-                        let port = port.parse::<u16>().expect("Invalid port");
-
-                        let routes = pod
-                            .annotations()
-                            .get("tunnel/routes")
-                            .map_or(vec![], |routes| routes.lines().map(str::to_owned).collect());
-
-                        let dns: Option<String> =
-                            pod.annotations().get("tunnel/dns").map(|x| x.to_owned());
-                        (port, routes, dns)
-                    }
-
-                    Ok(None) => {
-                        eprintln!("Pod not found {name}");
-                        return Ok(());
-                    }
-
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(());
-                    }
-                };
-
-            let mut dev = create_device().expect("Unable to create TUN");
-
-            // Apply per-route OS routing so traffic hits the TUN interface.
-            println!("APPLYING ROUTES: \n");
-            for route in routes.clone() {
-                let _ = std::process::Command::new("route")
-                    .args([
-                        "-n",
-                        "add",
-                        "-net",
-                        route.as_str(),
-                        "-interface",
-                        dev.tun_name().expect("Invalid TUN name").as_str(),
-                    ])
-                    .status();
-            }
-
-            if let Some(dns) = dns.clone() {
-                for mut line in dns.lines().map(|l| l.split(": ")) {
-                    if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
-                        let search = kubectl_tunnel::utils::group_by_base_suffix(
-                            search.split_ascii_whitespace(),
-                        );
-
-                        for (domain, search) in search {
-                            let resolver_path = &format!("/etc/resolver/{domain}");
-                            let path = std::path::Path::new(resolver_path);
-                            if let Some(parent) = path.parent() {
-                                std::fs::create_dir_all(parent)
-                                    .expect("Unable to create dns resolver folder");
-                            }
-
-                            let mut file =
-                                std::fs::File::create(path).expect("Unable to create dns resolver");
-                            let resolver = format!(
-                                "search {}\nnameserver {nameserver}",
-                                search.join(" ").to_string()
-                            );
-                            if let Ok(_) = writeln!(file, "{resolver}") {
-                                println!(
-                                    "\n\nAPPLYING DNS: \n\ncat <<EOF >> {resolver_path}\n{resolver}\nEOF"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            loop {
-                // Start the Kubernetes port-forward and bridge it to the TUN device.
-                let mut forwarder = pods.portforward(&name, &[port]).await?;
-                if let Some(upstream_conn) = forwarder.take_stream(port) {
-                    match create_tunnel(&mut dev, upstream_conn).await {
-                        Ok((name, conn)) => {
-                            let _ = conn.await;
-                        }
-                        Err(err) => eprintln!("Tunnel error: {err}"),
-                    }
-                } else {
-                    eprintln!("Port-forward stream missing for port {port}");
-                }
-            }
-        }
-
-        Commands::Create { file_name } => {
-            let file = std::fs::File::open(&file_name).unwrap();
-            let pod: Pod = serde_yaml::from_reader(file).unwrap();
-            match pods.create(&PostParams::default(), &pod).await {
-                Ok(pod) => println!("pod/{} created", pod.name_any()),
-                Err(err) => {
-                    eprintln!("{err:?}")
-                }
-            }
-        }
-
-        Commands::Delete { name } => match pods.delete(&name, &DeleteParams::default()).await {
-            Ok(either::Either::Left(pod)) => {
-                println!("pod \"{name}\" deleted from default namespace");
-                if let Some(uid) = pod.uid() {
-                    if let Err(err) = await_condition(pods.clone(), &name, is_deleted(&uid)).await {
-                        eprintln!("{err}");
-                    }
-                }
-            }
-
-            Ok(either::Either::Right(status)) => {
-                println!("DELETE STATUS {status}");
-            }
-
-            Err(err) => match err {
-                kube::Error::Api(status) => eprintln!("Error from server: {status}"),
-                _ => eprintln!("{err}"),
-            },
-        },
+        Commands::Connect { name } => run_connect(pods, name).await?,
+        Commands::Create { file_name } => run_create(pods, file_name).await?,
+        Commands::Delete { name } => run_delete(pods, name).await?,
     }
 
     Ok(())

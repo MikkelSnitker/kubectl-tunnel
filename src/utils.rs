@@ -94,9 +94,9 @@ pub fn create_device() -> std::result::Result<AsyncDevice, tun::Error> {
     let mut config = tun::Configuration::default();
        
    config
-        .address("0.0.0.1")
+        .address(Ipv4Addr::LOCALHOST)
         .netmask("255.255.255.255")
-        .destination("0.0.0.1")
+        .destination(Ipv4Addr::LOCALHOST)
         .mtu(1500)
         .down();
 
