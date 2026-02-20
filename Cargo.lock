@@ -1198,6 +1198,7 @@ dependencies = [
  "futures 0.3.32",
  "k8s-openapi",
  "kube",
+ "nix",
  "packet",
  "ratatui",
  "serde",

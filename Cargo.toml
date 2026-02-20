@@ -26,3 +26,4 @@ tokio-util = { version = "0.7.18", features = ["full"] }
 tun = { version = "0.8.5", features = ["async"] }
 ratatui = "0.29.0"
 crossterm = "0.29.0"
+nix = { version = "0.30.1", default-features = false, features = ["user"] }

@@ -26,6 +26,8 @@ use kubectl_tunnel::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use k8s_openapi::api::core::v1::Pod;
+#[cfg(unix)]
+use nix::unistd::geteuid;
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -37,6 +39,16 @@ struct TunnelSettings {
     port: u16,
     routes: Vec<String>,
     dns: Option<String>,
+}
+
+fn ensure_root_access() {
+    #[cfg(unix)]
+    {
+        if !geteuid().is_root() {
+            eprintln!("kubectl-tunnel requires root privileges. Please run with sudo.");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -411,6 +423,7 @@ async fn run_delete(pods: Api<Pod>, pod_name: String) -> std::result::Result<(),
 #[tokio::main]
 async fn main() -> std::result::Result<(), kube::Error> {
     let args = Cli::parse();
+    ensure_root_access();
     let kubeconfig = Kubeconfig::read()?;
     let options = KubeConfigOptions {
         context: args.context.or_else(|| std::env::var("KUBE_CONTEXT").ok()),
