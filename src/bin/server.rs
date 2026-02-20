@@ -67,12 +67,12 @@ async fn main() -> Result<()> {
     let dev = tun::create_as_async(&config).unwrap();
 
     let (tun_writer, mut tun_reader) = dev.split()?;
-   
+
     let tun_writer = Arc::new(Mutex::new(tun_writer));
     let tunnel = tunnels.clone();
     tokio::spawn(async move {
         let tunnels = tunnel;
-    
+
         let mut bufa = BytesMut::with_capacity(MAX_SIZE);
         let mut buf = [0x0u8; MAX_SIZE];
 
@@ -82,12 +82,11 @@ async fn main() -> Result<()> {
                     bufa.put_slice(&buf[0..len]);
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
-
                         let mut lock = tunnels.lock().await;
                         let dst = Ipv4Addr::from_octets(
                             packet[16..20].try_into().expect("Invalid header"),
                         );
-                            
+
                         if let Some(dst) = lock.get_mut(&dst) {
                             let _ = dst.send(packet).await;
                         }
@@ -168,7 +167,6 @@ async fn main() -> Result<()> {
                             }
                             drop(tunnels);
                         }
-                       
                     }
 
                     println!("Client disconnected... ");

@@ -24,3 +24,5 @@ tokio-codec = "0.1.2"
 tokio-io = "0.1.13"
 tokio-util = { version = "0.7.18", features = ["full"] }
 tun = { version = "0.8.5", features = ["async"] }
+ratatui = "0.29.0"
+crossterm = "0.29.0"

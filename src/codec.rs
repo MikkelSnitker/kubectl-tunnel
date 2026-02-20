@@ -4,7 +4,6 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use packet::{Packet, Size};
 use tokio_util::codec::{Decoder, Encoder};
 
-
 pub struct TUNCodec(pub u16, pub bool);
 
 fn decode_ipv4(prefix_len: usize, src: &mut BytesMut) -> Result<Option<Bytes>, packet::Error> {
@@ -106,12 +105,16 @@ pub fn parse_packet(
                 let valid_checksum = ipv4_header_valid(&val[0..ihl]);
                 let total_len = u16::from_be_bytes([val[2], val[3]]) as usize;
                 if total_len != val.len() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid packet length"));
-                    
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid packet length",
+                    ));
                 }
                 if !valid_checksum {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum"));
-                    
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid checksum",
+                    ));
                 }
 
                 return Ok(Some(val));
@@ -139,12 +142,11 @@ pub fn encode(src: Bytes) -> Result<Bytes, std::io::Error> {
             }
         };
         dst.put_u32(frame);
-    }        
+    }
 
-        dst.put(src);
+    dst.put(src);
 
     return Ok(dst.freeze());
-
 }
 impl Decoder for TUNCodec {
     type Item = Bytes;
@@ -194,12 +196,9 @@ impl Encoder<Bytes> for TUNCodec {
     }
 }
 
-
-
 #[cfg(not(target_os = "macos"))]
 pub const PREFIX_SIZE: usize = 0;
 #[cfg(target_os = "macos")]
 pub const PREFIX_SIZE: usize = 4;
 
 pub const MAX_SIZE: usize = 1024 * 96;
-

@@ -3,7 +3,10 @@ use std::net::Ipv4Addr;
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use kubectl_tunnel::{codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet}, utils::create_device};
+use kubectl_tunnel::{
+    codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet},
+    utils::create_device,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, tcp::OwnedReadHalf},

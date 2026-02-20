@@ -4,12 +4,16 @@ use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf};
 use tun::{AsyncDevice, ToAddress};
 
 pub fn linux_pi_proto(buf: &[u8]) -> Option<u16> {
-    if buf.len() < 4 { return None; }
+    if buf.len() < 4 {
+        return None;
+    }
     Some(u16::from_be_bytes([buf[2], buf[3]])) // proto in network order
 }
 
 pub fn macos_utun_af(buf: &[u8]) -> Option<u32> {
-    if buf.len() < 4 { return None; }
+    if buf.len() < 4 {
+        return None;
+    }
     Some(u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]])) // host order
 }
 
@@ -37,7 +41,11 @@ pub fn macos_to_linux(buf: &mut [u8]) -> Result<(), HeaderConvError> {
             buf[2] = 0x86;
             buf[3] = 0xdd;
         }
-         _ => return Err(HeaderConvError::UnknownProto(( (buf[2] as u16) << 8 ) + buf[3] as u16))
+        _ => {
+            return Err(HeaderConvError::UnknownProto(
+                ((buf[2] as u16) << 8) + buf[3] as u16,
+            ));
+        }
     }
 
     Ok(())
@@ -48,7 +56,7 @@ pub fn linux_to_macos(buf: &mut [u8]) -> Result<(), HeaderConvError> {
         return Err(HeaderConvError::TooShort);
     }
 
-     // Map EtherType -> macOS address family
+    // Map EtherType -> macOS address family
     match (buf[2], buf[3]) {
         (0x08, 0x00) => {
             // IPv4 -> AF_INET
@@ -62,7 +70,11 @@ pub fn linux_to_macos(buf: &mut [u8]) -> Result<(), HeaderConvError> {
             buf[3] = 0x1e;
         }
 
-        _ => return Err(HeaderConvError::UnknownProto(( (buf[2] as u16) << 8 ) + buf[3] as u16))
+        _ => {
+            return Err(HeaderConvError::UnknownProto(
+                ((buf[2] as u16) << 8) + buf[3] as u16,
+            ));
+        }
     }
     Ok(())
 }
@@ -92,8 +104,8 @@ pub fn parse_cidr_mask(
 
 pub fn create_device() -> std::result::Result<AsyncDevice, tun::Error> {
     let mut config = tun::Configuration::default();
-       
-   config
+
+    config
         .address(Ipv4Addr::LOCALHOST)
         .netmask("255.255.255.255")
         .destination(Ipv4Addr::LOCALHOST)
@@ -145,9 +157,8 @@ pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
 
     Ok(config)
 
-  //  tun::create_as_async(&config)
+    //  tun::create_as_async(&config)
 }
-
 
 use std::collections::BTreeMap;
 

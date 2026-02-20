@@ -1,4 +1,10 @@
-use std::{io::Write, net::{IpAddr, Ipv4Addr}};
+use std::{
+    io::Write,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::{BufMut as _, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -13,6 +19,7 @@ use kube::{
 };
 use kubectl_tunnel::{
     codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet},
+    nettop::{PacketDirection, SessionTracker, TopBarState, TunnelConnectionStatus, run_ui},
     utils::{create_device, handle_handshake},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -53,7 +60,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Connect to a pod and start the tunnel
-    Connect { name: String },
+    Connect {
+        name: String,
+        #[arg(long, default_value_t = false)]
+        tui: bool,
+    },
 
     /// Delete a pod
     Delete { name: String },
@@ -65,15 +76,15 @@ pub enum Commands {
 async fn create_tunnel<'a>(
     dev: &'a mut AsyncDevice,
     stream: impl AsyncRead + AsyncWrite + Unpin + 'a,
+    tracker: Option<Arc<Mutex<SessionTracker>>>,
+    top_bar: Arc<RwLock<TopBarState>>,
 ) -> Result<(String, impl Future<Output = Result<()>> + 'a)> {
-    if let Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) =  dev.address() {
-        println!("LOCAL")
-    }
     let (mut tcp_reader, tcp_writer) = tokio::io::split(stream);
 
     let config = handle_handshake(&mut tcp_reader).await?;
-    
+
     dev.configure(&config)?;
+    refresh_top_bar_endpoints(dev, &top_bar);
     let mtu = dev.mtu().expect("Invalid mtu");
     let device_name = dev.tun_name()?;
 
@@ -83,10 +94,16 @@ async fn create_tunnel<'a>(
     let (mut tun_reader, mut tun_writer) = tokio::io::split(dev);
 
     // TCP -> TUN: read from the port-forward stream and write into the TUN device.
+    let tracker_a = tracker.clone();
     let task_a = async move {
         while let Some(packet) = tcp_reader.next().await {
             match packet {
                 Ok(packet) => {
+                    if let Some(tracker) = &tracker_a {
+                        if let Ok(mut tracker) = tracker.lock() {
+                            tracker.observe(PacketDirection::Inbound, &packet);
+                        }
+                    }
                     match encode(packet) {
                         Ok(encoded) => {
                             if let Err(err) = tun_writer.write_all(&encoded).await {
@@ -106,6 +123,7 @@ async fn create_tunnel<'a>(
     };
 
     // TUN -> TCP: read from the TUN device and write back to the port-forward stream.
+    let tracker_b = tracker.clone();
     let task_b = async move {
         let mut bufa = BytesMut::with_capacity(MAX_SIZE);
         let mut buf = [0x0u8; MAX_SIZE];
@@ -117,6 +135,11 @@ async fn create_tunnel<'a>(
                     bufa.put_slice(&buf[0..len]);
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
+                        if let Some(tracker) = &tracker_b {
+                            if let Ok(mut tracker) = tracker.lock() {
+                                tracker.observe(PacketDirection::Outbound, &packet);
+                            }
+                        }
                         if let Err(err) = tcp_writer.send(packet).await {
                             eprintln!("Failed writing to TCP stream: {err}");
                             break;
@@ -138,6 +161,19 @@ async fn create_tunnel<'a>(
     };
 
     Ok((device_name, fut))
+}
+
+fn refresh_top_bar_endpoints(dev: &AsyncDevice, top_bar: &Arc<RwLock<TopBarState>>) {
+    if let Ok(mut top) = top_bar.write() {
+        top.address = dev.address().ok().map(|ip| ip.to_string());
+        top.destination = dev.destination().ok().map(|ip| ip.to_string());
+    }
+}
+
+fn set_top_bar_status(top_bar: &Arc<RwLock<TopBarState>>, status: TunnelConnectionStatus) {
+    if let Ok(mut top) = top_bar.write() {
+        top.status = status;
+    }
 }
 
 fn extract_tunnel_settings(pod: &Pod) -> std::result::Result<TunnelSettings, String> {
@@ -175,7 +211,14 @@ fn apply_routes(interface_name: &str, routes: &[String]) {
     println!("APPLYING ROUTES:\n");
     for route in routes {
         if let Err(err) = std::process::Command::new("route")
-            .args(["-n", "add", "-net", route.as_str(), "-interface", interface_name])
+            .args([
+                "-n",
+                "add",
+                "-net",
+                route.as_str(),
+                "-interface",
+                interface_name,
+            ])
             .status()
         {
             eprintln!("Unable to apply route {route}: {err}");
@@ -190,7 +233,8 @@ fn apply_dns(dns: Option<&str>) {
 
     for mut line in dns.lines().map(|l| l.split(": ")) {
         if let (Some(nameserver), Some(search)) = (line.next(), line.next()) {
-            let grouped = kubectl_tunnel::utils::group_by_base_suffix(search.split_ascii_whitespace());
+            let grouped =
+                kubectl_tunnel::utils::group_by_base_suffix(search.split_ascii_whitespace());
             for (domain, search) in grouped {
                 let resolver_path = format!("/etc/resolver/{domain}");
                 let path = std::path::Path::new(&resolver_path);
@@ -220,8 +264,11 @@ fn apply_dns(dns: Option<&str>) {
     }
 }
 
-async fn run_connect(pods: Api<Pod>, pod_name: String) -> std::result::Result<(), kube::Error> {
-    
+async fn run_connect(
+    pods: Api<Pod>,
+    pod_name: String,
+    tui: bool,
+) -> std::result::Result<(), kube::Error> {
     let mut dev = create_device().expect("Unable to create TUN");
 
     let tun_name = match dev.tun_name() {
@@ -248,33 +295,69 @@ async fn run_connect(pods: Api<Pod>, pod_name: String) -> std::result::Result<()
         }
     };
 
-    
-
     apply_routes(&tun_name, &settings.routes);
     apply_dns(settings.dns.as_deref());
 
+    let tracker = if tui {
+        Some(Arc::new(Mutex::new(SessionTracker::new())))
+    } else {
+        None
+    };
+    let top_bar = Arc::new(RwLock::new(TopBarState::new(
+        TunnelConnectionStatus::Initializing,
+    )));
+    refresh_top_bar_endpoints(&dev, &top_bar);
+    let stop = Arc::new(AtomicBool::new(false));
+    let ui_thread = if tui {
+        let ui_tracker = tracker.clone().expect("tracker exists when tui=true");
+        let ui_stop = stop.clone();
+        let ui_tun = tun_name.clone();
+        let ui_pod = pod_name.clone();
+        let ui_top_bar = top_bar.clone();
+        Some(std::thread::spawn(move || {
+            if let Err(err) = run_ui(ui_tracker, ui_stop, ui_tun, ui_pod, ui_top_bar) {
+                eprintln!("TUI error: {err}");
+            }
+        }))
+    } else {
+        None
+    };
+
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        set_top_bar_status(&top_bar, TunnelConnectionStatus::Connecting);
         let mut forwarder = pods.portforward(&pod_name, &[settings.port]).await?;
         if let Some(upstream_conn) = forwarder.take_stream(settings.port) {
-            println!("Connected...");
-            match create_tunnel(&mut dev, upstream_conn).await {
+            set_top_bar_status(&top_bar, TunnelConnectionStatus::Connected);
+            match create_tunnel(&mut dev, upstream_conn, tracker.clone(), top_bar.clone()).await {
                 Ok((_name, conn)) => {
                     let _ = conn.await;
-                    println!("Reconnecting...");
-                    
+                    set_top_bar_status(&top_bar, TunnelConnectionStatus::Reconnecting);
                 }
-                Err(err) => eprintln!("Tunnel error: {err}"),
+                Err(err) => {
+                    set_top_bar_status(&top_bar, TunnelConnectionStatus::Error);
+                    eprintln!("Tunnel error: {err}");
+                }
             }
         } else {
+            set_top_bar_status(&top_bar, TunnelConnectionStatus::Disconnected);
             eprintln!("Port-forward stream missing for port {}", settings.port);
         }
     }
+
+    set_top_bar_status(&top_bar, TunnelConnectionStatus::Stopped);
+    stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = ui_thread {
+        let _ = handle.join();
+    }
+
+    Ok(())
 }
 
-async fn run_create(
-    pods: Api<Pod>,
-    file_name: String,
-) -> std::result::Result<(), kube::Error> {
+async fn run_create(pods: Api<Pod>, file_name: String) -> std::result::Result<(), kube::Error> {
     let file = match std::fs::File::open(&file_name) {
         Ok(file) => file,
         Err(err) => {
@@ -299,10 +382,7 @@ async fn run_create(
     Ok(())
 }
 
-async fn run_delete(
-    pods: Api<Pod>,
-    pod_name: String,
-) -> std::result::Result<(), kube::Error> {
+async fn run_delete(pods: Api<Pod>, pod_name: String) -> std::result::Result<(), kube::Error> {
     match pods.delete(&pod_name, &DeleteParams::default()).await {
         Ok(either::Either::Left(pod)) => {
             println!("pod \"{pod_name}\" deleted from default namespace");
@@ -340,7 +420,7 @@ async fn main() -> std::result::Result<(), kube::Error> {
         Api::default_namespaced(client)
     };
     match args.command {
-        Commands::Connect { name } => run_connect(pods, name).await?,
+        Commands::Connect { name, tui } => run_connect(pods, name, tui).await?,
         Commands::Create { file_name } => run_create(pods, file_name).await?,
         Commands::Delete { name } => run_delete(pods, name).await?,
     }
