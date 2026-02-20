@@ -9,7 +9,7 @@ use kubectl_tunnel::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, tcp::OwnedReadHalf},
+    net::TcpStream,
 };
 use tun::AbstractDevice;
 
@@ -30,49 +30,67 @@ pub struct Cli {
 async fn main() -> Result<()> {
     let args = Cli::parse();
     let stream = TcpStream::connect((args.server, args.port)).await?;
-    let (mut reader, writer) = stream.into_split();
+    let (mut tcp_reader, mut tcp_writer) = stream.into_split();
 
     let mut dev = create_device().expect("Unable to create TUN");
-    if let Ok(config) = kubectl_tunnel::utils::handle_handshake(&mut reader).await {
-        dev.configure(&config)?;
-        println!("TUN {}", dev.tun_name().unwrap());
-        let mtu = dev.mtu().unwrap();
+    let address = match dev.address() {
+        Ok(std::net::IpAddr::V4(addr)) => addr,
+        _ => Ipv4Addr::LOCALHOST,
+    };
 
-        let mut reader = tokio_util::codec::FramedRead::new(reader, TUNCodec(mtu, false));
-        let mut writer = tokio_util::codec::FramedWrite::new(writer, TUNCodec(mtu, false));
-        let (mut tun_writer, mut tun_reader) = dev.split()?;
-
-        tokio::spawn(async move {
-            let mut bufa = BytesMut::with_capacity(MAX_SIZE);
-            let mut buf = [0x0u8; MAX_SIZE];
-
-            loop {
-                match tun_reader.read(&mut buf).await {
-                    Ok(len) => {
-                        bufa.put_slice(&buf[0..len]);
-
-                        while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
-                            let _ = writer.send(packet).await;
-                        }
-                    }
-
-                    Err(err) => {
-                        eprintln!("{err}");
-                    }
-                };
+    let config =
+        match kubectl_tunnel::utils::handle_handshake(&mut tcp_reader, &mut tcp_writer, address)
+            .await
+        {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Handshake failed: {err}");
+                return Ok(());
             }
-        });
+        };
 
-        while let Some(packet) = reader.next().await {
-            match packet {
-                Ok(packet) => {
-                    let _ = tun_writer.write(&encode(packet)?).await;
+    dev.configure(&config)?;
+    let tun_name = dev.tun_name()?;
+    println!("TUN {tun_name}");
+    let mtu = dev.mtu()?;
+
+    let mut net_reader = tokio_util::codec::FramedRead::new(tcp_reader, TUNCodec(mtu, false));
+    let mut net_writer = tokio_util::codec::FramedWrite::new(tcp_writer, TUNCodec(mtu, false));
+    let (mut tun_writer, mut tun_reader) = dev.split()?;
+
+    tokio::spawn(async move {
+        let mut bufa = BytesMut::with_capacity(MAX_SIZE);
+        let mut buf = [0x0u8; MAX_SIZE];
+
+        loop {
+            match tun_reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(len) => {
+                    bufa.put_slice(&buf[0..len]);
+
+                    while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
+                        let _ = net_writer.send(packet).await;
+                    }
                 }
+
                 Err(err) => {
-                    eprintln!("Error {err}");
+                    eprintln!("{err}");
+                    break;
                 }
             }
         }
+    });
+
+    while let Some(packet) = net_reader.next().await {
+        match packet {
+            Ok(packet) => {
+                let _ = tun_writer.write_all(&encode(packet)?).await;
+            }
+            Err(err) => {
+                eprintln!("Error {err}");
+            }
+        }
     }
+
     Ok(())
 }

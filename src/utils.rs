@@ -1,6 +1,10 @@
 use std::{net::Ipv4Addr, str::FromStr};
 
-use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf};
+use k8s_openapi::api::networking::v1::IPAddress;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::tcp::OwnedReadHalf,
+};
 use tun::{AsyncDevice, ToAddress};
 
 pub fn linux_pi_proto(buf: &[u8]) -> Option<u16> {
@@ -126,22 +130,34 @@ pub fn create_device() -> std::result::Result<AsyncDevice, tun::Error> {
     tun::create_as_async(&config)
 }
 
-pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
-    reader: &mut T,
+pub async fn handle_handshake<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    address: Ipv4Addr,
 ) -> std::result::Result<tun::Configuration, tun::Error> {
-    let mut handshake = [0u8; 14];
-    let _len = reader.read_exact(&mut handshake).await?;
-    let local = Ipv4Addr::from_octets(handshake[0..4].try_into().expect("Invalid bytes"));
-    let mask = Ipv4Addr::from_octets(handshake[4..8].try_into().expect("Invalid bytes"));
-    let remote = Ipv4Addr::from_octets(handshake[8..12].try_into().expect("Invalid bytes"));
-    let mtu = u16::from_be_bytes(handshake[12..14].try_into().expect("Invalid bytes"));
+    let request = HandshakeRequest {
+        version: 1,
+        address: if address == Ipv4Addr::LOCALHOST {
+            0.into()
+        } else {
+            address
+        },
+    };
 
+    let _ = writer.write(&Vec::<u8>::from(request)).await;
+
+    let mut handshake = [0u8; 16];
+    let len = reader.read_exact(&mut handshake).await?;
+
+    let response = HandshakeResponse::try_from(&handshake[0..len])
+        .map_err(|err| tun::Error::String(format!("Invalid handshake {err:?}").into()))?;
+    println!("HANDSHAKE {:?}", response);
     let mut config = tun::Configuration::default();
     config
-        .address(local)
-        .netmask(mask)
-        .destination(remote)
-        .mtu(mtu)
+        .address(response.local_address)
+        .netmask(response.netmask)
+        .destination(response.remote_address)
+        .mtu(response.mtu_size)
         .up();
 
     config.platform_config(|config| {
@@ -161,6 +177,8 @@ pub async fn handle_handshake<T: tokio::io::AsyncRead + Unpin>(
 }
 
 use std::collections::BTreeMap;
+
+use crate::handshake::{HandshakeRequest, HandshakeResponse};
 
 /// Group domains by their "base" suffix (last 2 labels).
 /// Examples:

@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    net::{IpAddr, Ipv4Addr},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -79,9 +80,14 @@ async fn create_tunnel<'a>(
     tracker: Option<Arc<Mutex<SessionTracker>>>,
     top_bar: Arc<RwLock<TopBarState>>,
 ) -> Result<(String, impl Future<Output = Result<()>> + 'a)> {
-    let (mut tcp_reader, tcp_writer) = tokio::io::split(stream);
+    let (mut tcp_reader, mut tcp_writer) = tokio::io::split(stream);
 
-    let config = handle_handshake(&mut tcp_reader).await?;
+    let address = match dev.address() {
+        Ok(IpAddr::V4(addr)) => addr,
+        _ => Ipv4Addr::LOCALHOST,
+    };
+
+    let config = handle_handshake(&mut tcp_reader, &mut tcp_writer, address).await?;
 
     dev.configure(&config)?;
     refresh_top_bar_endpoints(dev, &top_bar);

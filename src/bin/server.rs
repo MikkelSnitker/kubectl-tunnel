@@ -1,14 +1,16 @@
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use kubectl_tunnel::codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet};
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, u32};
+use kubectl_tunnel::{
+    codec::{MAX_SIZE, PREFIX_SIZE, TUNCodec, encode, parse_packet},
+    handshake::{HandshakeRequest, HandshakeResponse},
+};
+use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, time::Duration, u32};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt},
     net::{TcpListener, tcp::OwnedWriteHalf},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
 };
-use tokio_util::codec::Decoder;
 
 #[derive(Parser, Debug)]
 #[command(name = "tunnel", about = "Tunnel server", version)]
@@ -25,6 +27,15 @@ pub struct Cli {
 }
 
 type Result<T> = std::result::Result<T, std::io::Error>;
+type TunnelWriter = tokio_util::codec::FramedWrite<OwnedWriteHalf, TUNCodec>;
+type TunnelMap = HashMap<Ipv4Addr, Option<TunnelWriter>>;
+
+fn packet_destination(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.len() < 20 {
+        return None;
+    }
+    Some(Ipv4Addr::from_octets(packet[16..20].try_into().ok()?))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,10 +45,7 @@ async fn main() -> Result<()> {
     let network = Ipv4Addr::from(u32::from(network) & u32::from(mask));
     println!("Network {} Mask {}", network, mask);
     let available_hosts = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
-    let tunnels = Arc::new(Mutex::new(HashMap::<
-        Ipv4Addr,
-        tokio_util::codec::FramedWrite<OwnedWriteHalf, TUNCodec>,
-    >::new()));
+    let tunnels = Arc::new(RwLock::new(TunnelMap::new()));
 
     let num_of_hosts = u32::MAX - u32::from(mask) - 1;
     let mut next_host = 1;
@@ -69,6 +77,7 @@ async fn main() -> Result<()> {
     let (tun_writer, mut tun_reader) = dev.split()?;
 
     let tun_writer = Arc::new(Mutex::new(tun_writer));
+
     let tunnel = tunnels.clone();
     tokio::spawn(async move {
         let tunnels = tunnel;
@@ -82,16 +91,13 @@ async fn main() -> Result<()> {
                     bufa.put_slice(&buf[0..len]);
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
-                        let mut lock = tunnels.lock().await;
-                        let dst = Ipv4Addr::from_octets(
-                            packet[16..20].try_into().expect("Invalid header"),
-                        );
-
-                        if let Some(dst) = lock.get_mut(&dst) {
+                        let Some(dst) = packet_destination(&packet) else {
+                            continue;
+                        };
+                        let mut lock = tunnels.write().await;
+                        if let Some(Some(dst)) = lock.get_mut(&dst) {
                             let _ = dst.send(packet).await;
                         }
-
-                        drop(lock);
                     }
                 }
 
@@ -105,19 +111,50 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
 
     while let Ok((mut stream, addr)) = listener.accept().await {
-        println!("Client connected {}", addr);
+        println!("Client {} connected ", addr);
 
-        let mut lock = available_hosts.lock().await;
-        let remote = lock.pop().or_else(|| {
-            if next_host + 1 > num_of_hosts {
-                return None;
+        let mut buf = [0u8; 6];
+        let handshake = tokio::select! {
+            _ = stream.read_exact(&mut buf) => {
+
+                 match  HandshakeRequest::try_from(&buf[..]) {
+                    Ok(request) if request.address == Ipv4Addr::from(0) => Some((request.version, None)),
+                    Ok(request) => Some((request.version, Some(request.address))),
+                    Err(_) => None
+
+                }
+
+            },
+
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                None
             }
-            {
-                next_host += 1;
-                return Some(Ipv4Addr::from(u32::from(network) + next_host));
+        };
+
+        let mut remote = None;
+
+        if let Some((_version, Some(address))) = handshake {
+            let mut tunnels = tunnels.write().await;
+
+            if !tunnels.contains_key(&address) {
+                tunnels.insert(address, None);
+                println!("Reuse address {}", address);
+                remote = Some(address);
             }
-        });
-        drop(lock);
+        }
+
+        if remote.is_none() {
+            let mut lock = available_hosts.lock().await;
+            remote = lock.pop().or_else(|| {
+                if next_host + 1 > num_of_hosts {
+                    return None;
+                }
+                {
+                    next_host += 1;
+                    return Some(Ipv4Addr::from(u32::from(network) + next_host));
+                }
+            });
+        }
 
         match remote {
             Some(remote) => {
@@ -127,14 +164,16 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
 
-                    println!("Assigned host {}", remote);
-                    let mut buf = Vec::with_capacity(14);
-                    buf.extend_from_slice(&remote.to_bits().to_be_bytes());
-                    buf.extend_from_slice(&mask.to_bits().to_be_bytes());
-                    buf.extend_from_slice(&local.to_bits().to_be_bytes());
-                    buf.extend_from_slice(&mtu.to_be_bytes());
+                    println!("Assigned IP {} to {}", remote, addr);
+                    let response = HandshakeResponse {
+                        version: 1,
+                        remote_address: remote,
+                        netmask: mask,
+                        local_address: local,
+                        mtu_size: mtu,
+                    };
 
-                    let _ = writer.write(&buf).await;
+                    let _ = writer.write_all(&Vec::<u8>::from(response)).await;
 
                     let writer = tokio_util::codec::FramedWrite::with_capacity(
                         writer,
@@ -147,31 +186,41 @@ async fn main() -> Result<()> {
                         MAX_SIZE,
                     );
                     {
-                        let mut tunnels = tunnels.lock().await;
+                        let mut tunnels = tunnels.write().await;
 
-                        tunnels.insert(remote, writer);
+                        tunnels.insert(remote, Some(writer));
                         drop(tunnels);
                     }
                     while let Some(packet) = reader.next().await {
                         if let Ok(packet) = packet {
-                            let mut tunnels = tunnels.lock().await;
-                            let dst = Ipv4Addr::from_octets(
-                                packet[16..20].try_into().expect("Invalid header"),
-                            );
-                            if let Some(dst) = tunnels.get_mut(&dst) {
+                            let Some(dst) = packet_destination(&packet) else {
+                                continue;
+                            };
+                            let mut tunnels = tunnels.write().await;
+                            if let Some(Some(dst)) = tunnels.get_mut(&dst) {
                                 let _ = dst.send(packet).await;
                             } else {
                                 let mut lock = tun_writer.lock().await;
                                 let _ = lock.write(&encode(packet)?).await;
-                                drop(lock);
                             }
-                            drop(tunnels);
                         }
                     }
 
-                    println!("Client disconnected... ");
-                    available_hosts.lock().await.push(remote);
-                    return Ok::<(), std::io::Error>(());
+                    {
+                        let mut tunnels = tunnels.write().await;
+                        tunnels.remove(&remote);
+                    }
+
+                    println!("Client {} disconnected... ", addr);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    {
+                        let tunnels = tunnels.write().await;
+                        if !tunnels.contains_key(&remote) {
+                            println!("Release IP {}", remote);
+                            available_hosts.lock().await.push(remote);
+                        }
+                    }
+                    Ok::<(), std::io::Error>(())
                 });
             }
             None => {

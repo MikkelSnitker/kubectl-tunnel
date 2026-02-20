@@ -457,11 +457,7 @@ pub fn run_ui(
                 format_bytes(snapshot.total_tx_bps),
                 format_bytes(snapshot.total_rx_bps)
             ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Tunnel"),
-            );
+            .block(Block::default().borders(Borders::ALL).title("Tunnel"));
             f.render_widget(header, chunks[0]);
 
             let rows: Vec<Row> = snapshot
