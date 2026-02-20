@@ -151,7 +151,6 @@ pub async fn handle_handshake<R: tokio::io::AsyncRead + Unpin, W: tokio::io::Asy
 
     let response = HandshakeResponse::try_from(&handshake[0..len])
         .map_err(|err| tun::Error::String(format!("Invalid handshake {err:?}").into()))?;
-    println!("HANDSHAKE {:?}", response);
     let mut config = tun::Configuration::default();
     config
         .address(response.local_address)
