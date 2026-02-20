@@ -9,9 +9,11 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Release
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +60,27 @@ jobs:
           BIN=kubectl-tunnel
           cp target/${{ matrix.target }}/release/${BIN} dist/${BIN}
           tar -czf dist/${BIN}-${{ matrix.target }}.tar.gz -C dist ${BIN}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubectl-tunnel-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: kubectl-tunnel-*
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
