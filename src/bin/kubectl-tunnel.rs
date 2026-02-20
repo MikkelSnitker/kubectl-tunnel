@@ -287,6 +287,7 @@ async fn run_connect(
     pod_name: String,
     tui: bool,
 ) -> std::result::Result<(), kube::Error> {
+    ensure_root_access();
     let mut dev = create_device().expect("Unable to create TUN");
 
     let tun_name = match dev.tun_name() {
@@ -423,7 +424,7 @@ async fn run_delete(pods: Api<Pod>, pod_name: String) -> std::result::Result<(),
 #[tokio::main]
 async fn main() -> std::result::Result<(), kube::Error> {
     let args = Cli::parse();
-    ensure_root_access();
+
     let kubeconfig = Kubeconfig::read()?;
     let options = KubeConfigOptions {
         context: args.context.or_else(|| std::env::var("KUBE_CONTEXT").ok()),
