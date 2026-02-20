@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
@@ -19,7 +19,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction as LayoutDirection, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 #[derive(Clone, Copy)]
 pub enum PacketDirection {
@@ -73,6 +73,7 @@ impl TopBarState {
 enum Proto {
     Tcp,
     Udp,
+    Icmp,
     Other(u8),
 }
 
@@ -81,6 +82,7 @@ impl Proto {
         match self {
             Proto::Tcp => "TCP",
             Proto::Udp => "UDP",
+            Proto::Icmp => "ICMP",
             Proto::Other(_) => "IP",
         }
     }
@@ -143,6 +145,7 @@ struct SessionStats {
     tcp_state: TcpState,
 }
 
+#[derive(Clone)]
 pub struct SessionRow {
     pub proto: &'static str,
     pub state: &'static str,
@@ -161,6 +164,50 @@ pub struct Snapshot {
     pub active_sessions: usize,
     pub total_tx_bps: u64,
     pub total_rx_bps: u64,
+}
+
+#[derive(Clone, Copy)]
+enum GroupBy {
+    None,
+    Local,
+    Remote,
+}
+
+impl GroupBy {
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::None => "none",
+            GroupBy::Local => "local",
+            GroupBy::Remote => "remote",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            GroupBy::None => GroupBy::Local,
+            GroupBy::Local => GroupBy::Remote,
+            GroupBy::Remote => GroupBy::None,
+        }
+    }
+}
+
+struct GroupSummary {
+    sessions: Vec<SessionRow>,
+    tx_bps: u64,
+    rx_bps: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+}
+
+enum UiRowKind {
+    Group { key: String },
+    Session,
+}
+
+struct UiRow {
+    id: String,
+    kind: UiRowKind,
+    cells: Vec<String>,
 }
 
 pub struct SessionTracker {
@@ -314,7 +361,7 @@ impl ParsedPacket {
             return None;
         }
         let ihl = ((data[0] & 0x0f) as usize) * 4;
-        if ihl < 20 || data.len() < ihl + 4 {
+        if ihl < 20 || data.len() < ihl {
             return None;
         }
 
@@ -323,11 +370,21 @@ impl ParsedPacket {
         let proto = match data[9] {
             6 => Proto::Tcp,
             17 => Proto::Udp,
+            1 => Proto::Icmp,
             p => Proto::Other(p),
         };
 
-        let src_port = u16::from_be_bytes([data[ihl], data[ihl + 1]]);
-        let dst_port = u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]);
+        let (src_port, dst_port) = if matches!(proto, Proto::Tcp | Proto::Udp) {
+            if data.len() < ihl + 4 {
+                return None;
+            }
+            (
+                u16::from_be_bytes([data[ihl], data[ihl + 1]]),
+                u16::from_be_bytes([data[ihl + 2], data[ihl + 3]]),
+            )
+        } else {
+            (0, 0)
+        };
         let tcp_flags = parse_tcp_flags(data, ihl, proto)?;
 
         Some(Self {
@@ -341,7 +398,7 @@ impl ParsedPacket {
     }
 
     fn parse_v6(data: &[u8]) -> Option<Self> {
-        if data.len() < 44 {
+        if data.len() < 40 {
             return None;
         }
 
@@ -350,11 +407,21 @@ impl ParsedPacket {
         let proto = match data[6] {
             6 => Proto::Tcp,
             17 => Proto::Udp,
+            58 => Proto::Icmp,
             p => Proto::Other(p),
         };
 
-        let src_port = u16::from_be_bytes([data[40], data[41]]);
-        let dst_port = u16::from_be_bytes([data[42], data[43]]);
+        let (src_port, dst_port) = if matches!(proto, Proto::Tcp | Proto::Udp) {
+            if data.len() < 44 {
+                return None;
+            }
+            (
+                u16::from_be_bytes([data[40], data[41]]),
+                u16::from_be_bytes([data[42], data[43]]),
+            )
+        } else {
+            (0, 0)
+        };
         let tcp_flags = parse_tcp_flags(data, 40, proto)?;
 
         Some(Self {
@@ -368,6 +435,7 @@ impl ParsedPacket {
     }
 }
 
+#[inline]
 fn parse_tcp_flags(data: &[u8], transport_offset: usize, proto: Proto) -> Option<Option<TcpFlags>> {
     if proto != Proto::Tcp {
         return Some(None);
@@ -384,6 +452,7 @@ fn parse_tcp_flags(data: &[u8], transport_offset: usize, proto: Proto) -> Option
     }))
 }
 
+#[inline]
 fn next_tcp_state(current: TcpState, flags: TcpFlags) -> TcpState {
     if flags.rst {
         return TcpState::Reset;
@@ -408,6 +477,135 @@ fn next_tcp_state(current: TcpState, flags: TcpFlags) -> TcpState {
     current
 }
 
+fn build_ui_rows(rows: &[SessionRow], group_by: GroupBy, expanded: &HashSet<String>) -> Vec<UiRow> {
+    if matches!(group_by, GroupBy::None) {
+        let mut ordered = rows.to_vec();
+        ordered.sort_by(|a, b| {
+            (a.local.as_str(), a.remote.as_str(), a.proto).cmp(&(
+                b.local.as_str(),
+                b.remote.as_str(),
+                b.proto,
+            ))
+        });
+        return ordered
+            .iter()
+            .map(|s| UiRow {
+                id: format!("s:{}|{}|{}", s.proto, s.local, s.remote),
+                kind: UiRowKind::Session,
+                cells: vec![
+                    s.proto.to_string(),
+                    s.state.to_string(),
+                    s.local.clone(),
+                    s.remote.clone(),
+                    format_bytes(s.tx_bps),
+                    format_bytes(s.rx_bps),
+                    format_bytes(s.tx_bytes),
+                    format_bytes(s.rx_bytes),
+                    format_duration(s.age),
+                    format_duration(s.idle),
+                ],
+            })
+            .collect();
+    }
+
+    let mut groups: HashMap<String, GroupSummary> = HashMap::new();
+    for row in rows {
+        let key = match group_by {
+            GroupBy::Local => row.local.clone(),
+            GroupBy::Remote => row.remote.clone(),
+            GroupBy::None => unreachable!(),
+        };
+        let entry = groups.entry(key).or_insert_with(|| GroupSummary {
+            sessions: Vec::new(),
+            tx_bps: 0,
+            rx_bps: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+        });
+        entry.tx_bps += row.tx_bps;
+        entry.rx_bps += row.rx_bps;
+        entry.tx_bytes += row.tx_bytes;
+        entry.rx_bytes += row.rx_bytes;
+        entry.sessions.push(row.clone());
+    }
+
+    let mut grouped: Vec<(String, GroupSummary)> = groups.into_iter().collect();
+    grouped.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut ui_rows = Vec::new();
+    for (key, mut group) in grouped {
+        let marker = if expanded.contains(&key) {
+            "[-]"
+        } else {
+            "[+]"
+        };
+        let (local_cell, remote_cell) = match group_by {
+            GroupBy::Local => (
+                format!("{marker} {key} ({})", group.sessions.len()),
+                "*".to_string(),
+            ),
+            GroupBy::Remote => (
+                "*".to_string(),
+                format!("{marker} {key} ({})", group.sessions.len()),
+            ),
+            GroupBy::None => unreachable!(),
+        };
+
+        ui_rows.push(UiRow {
+            id: format!("g:{key}"),
+            kind: UiRowKind::Group { key: key.clone() },
+            cells: vec![
+                "GRP".to_string(),
+                "-".to_string(),
+                local_cell,
+                remote_cell,
+                format_bytes(group.tx_bps),
+                format_bytes(group.rx_bps),
+                format_bytes(group.tx_bytes),
+                format_bytes(group.rx_bytes),
+                "-".to_string(),
+                "-".to_string(),
+            ],
+        });
+
+        if expanded.contains(&key) {
+            group.sessions.sort_by(|a, b| {
+                (a.local.as_str(), a.remote.as_str(), a.proto).cmp(&(
+                    b.local.as_str(),
+                    b.remote.as_str(),
+                    b.proto,
+                ))
+            });
+            for session in group.sessions {
+                let (local_cell, remote_cell) = match group_by {
+                    GroupBy::Local => ("  ".to_string(), session.remote.clone()),
+                    GroupBy::Remote => (session.local.clone(), "  ".to_string()),
+                    GroupBy::None => unreachable!(),
+                };
+
+                ui_rows.push(UiRow {
+                    id: format!("s:{}|{}|{}", session.proto, session.local, session.remote),
+                    kind: UiRowKind::Session,
+                    cells: vec![
+                        session.proto.to_string(),
+                        session.state.to_string(),
+                        local_cell,
+                        remote_cell,
+                        format_bytes(session.tx_bps),
+                        format_bytes(session.rx_bps),
+                        format_bytes(session.tx_bytes),
+                        format_bytes(session.rx_bytes),
+                        format_duration(session.age),
+                        format_duration(session.idle),
+                    ],
+                });
+            }
+        }
+    }
+
+    ui_rows
+}
+
 pub fn run_ui(
     tracker: Arc<Mutex<SessionTracker>>,
     stop: Arc<AtomicBool>,
@@ -422,6 +620,11 @@ pub fn run_ui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    let mut group_by = GroupBy::None;
+    let mut expanded_groups = HashSet::<String>::new();
+    let mut selected_row = 0usize;
+    let mut selected_id: Option<String> = None;
+    let mut table_state = TableState::default();
 
     while !stop.load(Ordering::Relaxed) {
         let top = top_bar
@@ -435,6 +638,23 @@ pub fn run_ui(
                 .map_err(|_| io::Error::other("session tracker lock poisoned"))?;
             guard.snapshot()
         };
+        let ui_rows = build_ui_rows(&snapshot.rows, group_by, &expanded_groups);
+        if let Some(selected) = &selected_id
+            && let Some(idx) = ui_rows.iter().position(|r| &r.id == selected)
+        {
+            selected_row = idx;
+        }
+        if ui_rows.is_empty() {
+            selected_row = 0;
+            selected_id = None;
+            table_state.select(None);
+        } else {
+            if selected_row >= ui_rows.len() {
+                selected_row = ui_rows.len().saturating_sub(1);
+            }
+            selected_id = ui_rows.get(selected_row).map(|r| r.id.clone());
+            table_state.select(Some(selected_row));
+        }
 
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -460,23 +680,22 @@ pub fn run_ui(
             .block(Block::default().borders(Borders::ALL).title("Tunnel"));
             f.render_widget(header, chunks[0]);
 
-            let rows: Vec<Row> = snapshot
-                .rows
+            let rows: Vec<Row> = ui_rows
                 .iter()
                 .take(200)
-                .map(|s| {
-                    Row::new(vec![
-                        Cell::from(s.proto.to_string()),
-                        Cell::from(s.state.to_string()),
-                        Cell::from(s.local.clone()),
-                        Cell::from(s.remote.clone()),
-                        Cell::from(format_bytes(s.tx_bps)),
-                        Cell::from(format_bytes(s.rx_bps)),
-                        Cell::from(format_bytes(s.tx_bytes)),
-                        Cell::from(format_bytes(s.rx_bytes)),
-                        Cell::from(format_duration(s.age)),
-                        Cell::from(format_duration(s.idle)),
-                    ])
+                .map(|row| {
+                    let style = match row.kind {
+                        UiRowKind::Group { .. } => Style::default().fg(Color::Yellow),
+                        UiRowKind::Session => Style::default(),
+                    };
+                    Row::new(
+                        row.cells
+                            .iter()
+                            .cloned()
+                            .map(Cell::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(style)
                 })
                 .collect();
 
@@ -501,19 +720,56 @@ pub fn run_ui(
                     ])
                     .style(Style::default().fg(Color::Cyan)),
                 )
+                .row_highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol(">> ")
                 .block(Block::default().borders(Borders::ALL).title("Sessions"));
-            f.render_widget(table, chunks[1]);
+            f.render_stateful_widget(table, chunks[1], &mut table_state);
 
-            let footer = Paragraph::new("q: quit  esc: quit");
+            let footer = Paragraph::new(format!(
+                "esc: quit  g: group({})  up/down: select  enter: expand",
+                group_by.label()
+            ));
             f.render_widget(footer, chunks[2]);
         })?;
 
         if event::poll(Duration::from_millis(150))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
         {
-            stop.store(true, Ordering::Relaxed);
+            match key.code {
+                KeyCode::Esc => stop.store(true, Ordering::Relaxed),
+                KeyCode::Char('g') => {
+                    group_by = group_by.next();
+                    expanded_groups.clear();
+                    selected_row = 0;
+                    selected_id = None;
+                }
+                KeyCode::Up => {
+                    selected_row = selected_row.saturating_sub(1);
+                    selected_id = ui_rows.get(selected_row).map(|r| r.id.clone());
+                }
+                KeyCode::Down => {
+                    if selected_row + 1 < ui_rows.len() {
+                        selected_row += 1;
+                    }
+                    selected_id = ui_rows.get(selected_row).map(|r| r.id.clone());
+                }
+                KeyCode::Enter => {
+                    if let Some(UiRow {
+                        kind: UiRowKind::Group { key },
+                        ..
+                    }) = ui_rows.get(selected_row)
+                    {
+                        if expanded_groups.contains(key) {
+                            expanded_groups.remove(key);
+                        } else {
+                            expanded_groups.insert(key.clone());
+                        }
+                        selected_id = Some(format!("g:{key}"));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

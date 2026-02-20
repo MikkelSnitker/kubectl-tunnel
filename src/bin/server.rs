@@ -30,6 +30,7 @@ type Result<T> = std::result::Result<T, std::io::Error>;
 type TunnelWriter = tokio_util::codec::FramedWrite<OwnedWriteHalf, TUNCodec>;
 type TunnelMap = HashMap<Ipv4Addr, Option<TunnelWriter>>;
 
+#[inline]
 fn packet_destination(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.len() < 20 {
         return None;

@@ -118,7 +118,7 @@ async fn create_tunnel<'a>(
             match packet {
                 Ok(packet) => {
                     if let Some(tracker) = &tracker_a {
-                        if let Ok(mut tracker) = tracker.lock() {
+                        if let Ok(mut tracker) = tracker.try_lock() {
                             tracker.observe(PacketDirection::Inbound, &packet);
                         }
                     }
@@ -154,7 +154,7 @@ async fn create_tunnel<'a>(
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
                         if let Some(tracker) = &tracker_b {
-                            if let Ok(mut tracker) = tracker.lock() {
+                            if let Ok(mut tracker) = tracker.try_lock() {
                                 tracker.observe(PacketDirection::Outbound, &packet);
                             }
                         }
