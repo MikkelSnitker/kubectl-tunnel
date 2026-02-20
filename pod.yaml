@@ -33,4 +33,4 @@ spec:
       privileged: true
     stdin: true
     tty: true
-  restartPolicy: Never
+
