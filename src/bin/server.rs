@@ -167,9 +167,9 @@ async fn main() -> Result<()> {
                     println!("Assigned IP {} to {}", remote, addr);
                     let response = HandshakeResponse {
                         version: 1,
-                        remote_address: remote,
+                        remote_address: local,
                         netmask: mask,
-                        local_address: local,
+                        local_address: remote,
                         mtu_size: mtu,
                     };
 
