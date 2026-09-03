@@ -1,8 +1,8 @@
-use std::time::Duration;
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use packet::{Packet, Size};
 use tokio_util::codec::{Decoder, Encoder};
+
+/// Reserved control byte used to keep long-lived port-forward streams active.
+pub const HEARTBEAT: u8 = 0xf0;
 
 pub struct TUNCodec(pub u16, pub bool);
 
@@ -79,6 +79,10 @@ pub fn decode(prefix_len: usize, src: &mut BytesMut) -> Result<Option<Bytes>, pa
     if src.is_empty() {
         return Ok(None);
     }
+    if prefix_len == 0 && src[0] == HEARTBEAT {
+        src.advance(1);
+        return Ok(None);
+    }
 
     let version = src[prefix_len + 0] >> 4;
 
@@ -100,7 +104,7 @@ pub fn parse_packet(
         Ok(Some(val)) => {
             if let 4 = val[0] >> 4 {
                 let ihl = (val[0] & 0x0f) as usize * 4;
-                let checksum = u16::from_be_bytes([val[10], val[11]]);
+                let _checksum = u16::from_be_bytes([val[10], val[11]]);
 
                 let valid_checksum = ipv4_header_valid(&val[0..ihl]);
                 let total_len = u16::from_be_bytes([val[2], val[3]]) as usize;
@@ -155,6 +159,10 @@ impl Decoder for TUNCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let prefix_len = if self.1 { PREFIX_SIZE } else { 0 };
         if src.is_empty() {
+            return Ok(None);
+        }
+        if prefix_len == 0 && src[0] == HEARTBEAT {
+            src.advance(1);
             return Ok(None);
         }
 

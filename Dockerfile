@@ -23,7 +23,6 @@ WORKDIR /scripts
 RUN apk update && apk add iptables
 
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server /scripts/
-#RUN apk update && apk add socat iptables
-COPY init.sh /scripts/
-
-CMD [ "/scripts/init.sh" ]
+# The firewall sidecar configures forwarding and iptables. The tunnel image
+# only runs the server itself.
+CMD ["/bin/sh", "-c", "exec /scripts/server --network \"$TUNNEL_NETWORK\" --port \"$TUNNEL_PORT\" --mtu \"$TUNNEL_MTU\""]

@@ -132,15 +132,19 @@ async fn main() -> Result<()> {
             }
         };
 
+        let protocol_version = handshake
+            .as_ref()
+            .map(|(version, _)| if *version >= 2 { 2 } else { 1 })
+            .unwrap_or(1);
         let mut remote = None;
 
-        if let Some((_version, Some(address))) = handshake {
+        if let Some((_, Some(address))) = handshake.as_ref() {
             let mut tunnels = tunnels.write().await;
 
-            if !tunnels.contains_key(&address) {
-                tunnels.insert(address, None);
+            if !tunnels.contains_key(address) {
+                tunnels.insert(*address, None);
                 println!("Reuse address {}", address);
-                remote = Some(address);
+                remote = Some(*address);
             }
         }
 
@@ -167,7 +171,7 @@ async fn main() -> Result<()> {
 
                     println!("Assigned IP {} to {}", remote, addr);
                     let response = HandshakeResponse {
-                        version: 1,
+                        version: protocol_version,
                         remote_address: local,
                         netmask: mask,
                         local_address: remote,

@@ -3,6 +3,9 @@ name = "kubectl-tunnel"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [[bin]]
 name = "server"
 test = false
@@ -15,10 +18,13 @@ clap = { version = "4.5.58", features = ["derive"] }
 either = "1.15.0"
 futures = "0.3.32"
 k8s-openapi = { version = "0.27.0", features = ["latest"] }
-kube = { version = "3.0.1", features = ["runtime", "ws"] }
+kube = { version = "3.0.1", features = ["runtime", "ws", "derive"] }
 packet = "0.1.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
+serde_json = "1.0"
+secrecy = "0.10"
+schemars = "1.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-codec = "0.1.2"
 tokio-io = "0.1.13"

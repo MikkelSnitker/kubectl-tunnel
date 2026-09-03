@@ -1,11 +1,7 @@
 use std::{net::Ipv4Addr, str::FromStr};
 
-use k8s_openapi::api::networking::v1::IPAddress;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::OwnedReadHalf,
-};
-use tun::{AsyncDevice, ToAddress};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tun::AsyncDevice;
 
 pub fn linux_pi_proto(buf: &[u8]) -> Option<u16> {
     if buf.len() < 4 {
@@ -182,7 +178,6 @@ use crate::handshake::{HandshakeRequest, HandshakeResponse};
 /// Group domains by their "base" suffix (last 2 labels).
 /// Examples:
 /// - default.svc.cluster.local -> cluster.local
-/// - c.gowish-devx.internal    -> gowish-devx.internal
 /// - google.internal           -> google.internal
 pub fn group_by_base_suffix<'a, I>(domains: I) -> BTreeMap<String, Vec<String>>
 where

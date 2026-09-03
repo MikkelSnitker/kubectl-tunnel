@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::Arc};
 
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
@@ -10,6 +10,8 @@ use kubectl_tunnel::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::Mutex,
+    time::{self, Duration},
 };
 use tun::AbstractDevice;
 
@@ -55,7 +57,28 @@ async fn main() -> Result<()> {
     let mtu = dev.mtu()?;
 
     let mut net_reader = tokio_util::codec::FramedRead::new(tcp_reader, TUNCodec(mtu, false));
-    let mut net_writer = tokio_util::codec::FramedWrite::new(tcp_writer, TUNCodec(mtu, false));
+    let net_writer = Arc::new(Mutex::new(tokio_util::codec::FramedWrite::new(
+        tcp_writer,
+        TUNCodec(mtu, false),
+    )));
+    let heartbeat_writer = net_writer.clone();
+    tokio::spawn(async move {
+        let mut heartbeat = time::interval(Duration::from_secs(20));
+        loop {
+            heartbeat.tick().await;
+            if heartbeat_writer
+                .lock()
+                .await
+                .send(bytes::Bytes::from_static(&[
+                    kubectl_tunnel::codec::HEARTBEAT,
+                ]))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let (mut tun_writer, mut tun_reader) = dev.split()?;
 
     tokio::spawn(async move {
@@ -69,7 +92,7 @@ async fn main() -> Result<()> {
                     bufa.put_slice(&buf[0..len]);
 
                     while let Ok(Some(packet)) = parse_packet(PREFIX_SIZE, &mut bufa) {
-                        let _ = net_writer.send(packet).await;
+                        let _ = net_writer.lock().await.send(packet).await;
                     }
                 }
 
