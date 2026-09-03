@@ -5,7 +5,7 @@ metadata:
   annotations:
     tunnel/port: "1234"
     tunnel/dns: |
-      169.254.20.10: default.svc.cluster.local svc.cluster.local cluster.local europe-west1-c.c.gowish-devx.internal c.gowish-devx.internal google.internal psa-develop.gowish-internal gowish.gowish-internal
+      169.254.20.10: default.svc.cluster.local svc.cluster.local cluster.local
     tunnel/routes: |
       172.23.0.0/16 
       172.20.248.0/22
@@ -18,14 +18,13 @@ spec:
   - name: tunnel
     imagePullPolicy: Always
     image: ghcr.io/mikkelsnitker/tunnel:latest
-    
     env:
       - name: TUNNEL_PORT
         value: "1234"
       - name: TUNNEL_NETWORK
         value: "10.0.0.1/24"
       - name: TUNNEL_MTU
-        value: 1300
+        value: "1300"
     securityContext:
       capabilities:
         add:
